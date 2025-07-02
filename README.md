@@ -1,6 +1,6 @@
 # Empyrion Server Helper
 
-A comprehensive administration tool for Empyrion: Galactic Survival dedicated servers. Monitor players, manage entities, and edit game configurations in real-time through an intuitive GUI interface.
+This will become a comprehensive administration tool for Empyrion: Galactic Survival dedicated servers. Monitor players, manage entities, and edit game configurations in real-time through an intuitive GUI interface. For now it's in alpha stage really, but I decided to share it anyway. I will add more functionality.
 
 ![Empyrion Server Helper](https://img.shields.io/badge/Platform-Linux-blue)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-green)
