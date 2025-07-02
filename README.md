@@ -4,7 +4,7 @@ A comprehensive administration tool for Empyrion: Galactic Survival dedicated se
 
 ![Empyrion Server Helper](https://img.shields.io/badge/Platform-Linux-blue)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-green)
-![License](https://img.shields.io/badge/License-MIT-yellow)
+![License](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-orange)
 
 ## Features
 
@@ -232,7 +232,20 @@ Get help with:
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the **Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International License**.
+
+### What this means:
+- ✅ **You can freely use** this software for personal and non-commercial purposes
+- ✅ **You can modify** and redistribute the code
+- ✅ **You can share** it with others
+- 🚫 **You cannot sell** this software or use it for commercial purposes
+- 🔄 **Any modifications** must be shared under the same license
+- 👤 **You must give credit** to the original author
+
+**Full license text**: [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/)
+
+### Commercial Use
+If you're interested in commercial use or licensing, please contact the maintainers through our Discord community.
 
 ## Acknowledgments
 
