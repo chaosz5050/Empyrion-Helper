@@ -196,6 +196,8 @@ empyrion-server-helper/
 ### Performance
 - **Update interval** - Increase `update_interval` for slower servers
 - **Large servers** - Entity loading may take time with many structures
+- **Entity list** - Sometimes it happens that your entity list looks corrupt. Just restart the app and it will load correctly
+- **Saving changes from the config editor** - When you hit Save it can appear that the application hangs, this is not the case, just wait. I wil try to improve this
 
 ## Community & Support
 
