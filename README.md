@@ -10,7 +10,7 @@ A comprehensive administration tool for Empyrion: Galactic Survival dedicated se
 
 ### 🎮 Player Management
 - **Real-time player monitoring** - View online/offline players with live updates
-- **Player actions** - Kick, ban/unban, send private messages
+- **Player actions** - Kick, ban/unban, send private messages (private messages are not working currently)
 - **Global messaging** - Broadcast messages to all players
 - **Player details** - Steam ID, faction, IP address, current playfield
 
@@ -240,18 +240,16 @@ This project is licensed under the **Creative Commons Attribution-NonCommercial-
 - ✅ **You can share** it with others
 - 🚫 **You cannot sell** this software or use it for commercial purposes
 - 🔄 **Any modifications** must be shared under the same license
-- 👤 **You must give credit** to the original author
+- 👤 **You must give credit** to the original author (Link to my Github and/or Discord)
 
 **Full license text**: [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/)
 
 ### Commercial Use
-If you're interested in commercial use or licensing, please contact the maintainers through our Discord community.
+If you're interested in commercial use or licensing, please do not contact me. This code stays open source.
 
 ## Acknowledgments
 
 - **Eleon Game Studios** - For creating Empyrion: Galactic Survival
-- **Community** - For server administration insights and testing
-- **Contributors** - Thanks to everyone who helped improve this tool
 
 ## Disclaimer
 
@@ -267,4 +265,4 @@ Use at your own risk. The authors are not responsible for server issues or data 
 
 **Happy server administration!** 🚀
 
-For support, please open an issue on GitHub or contact the maintainers.
+For support, please join the Discord channel and I will try to help.
