@@ -36,7 +36,6 @@ password = your_ftp_password
 # Examples:
 #   /home/empyrion/ServerData/Scenarios/Default Multiplayer/Content/Configuration
 #   /Empyrion/Content/Scenarios/Reforged Eden/Content/Configuration
-#   C:\EmpyrionServer\Content\Scenarios\YourScenario\Content\Configuration
 remote_log_path = /path/to/your/scenario/Content/Configuration
 
 # ============================================================================
