@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QPushButton, QTabWidget, QTextEdit, QLabel,
                                QLineEdit, QHBoxLayout, QFormLayout, QTableWidget,
                                QTableWidgetItem, QMenu, QInputDialog, QHeaderView,
-                               QComboBox, QStatusBar)
+                               QComboBox, QStatusBar, QMessageBox)
 from PySide6.QtCore import QThread, Slot, Qt
 from backend import Worker
 
@@ -171,6 +171,11 @@ class MainWindow(QMainWindow):
         self.config_table.setSortingEnabled(True)
         self.config_table.itemChanged.connect(self.on_config_item_changed)
 
+        # Match the player table styling exactly - no custom CSS
+        self.config_table.setAlternatingRowColors(True)
+        self.config_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.config_table.setEditTriggers(QTableWidget.EditTriggers.DoubleClicked)
+
         header = self.config_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
@@ -290,7 +295,6 @@ class MainWindow(QMainWindow):
     def on_save_config_clicked(self):
         self.log_message("'Save Config Changes' button clicked.")
         if self.worker and self.config_changes_made:
-            from PySide6.QtWidgets import QMessageBox
             reply = QMessageBox.question(self, "Save Changes",
                                        "This will backup the original file and upload your changes.\nAre you sure?",
                                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
@@ -305,30 +309,42 @@ class MainWindow(QMainWindow):
                 if new_value <= 0:
                     raise ValueError("StackSize must be positive")
 
-                # Update the data
+                # Find the corresponding data item
                 row = item.row()
-                if row < len(self.all_config_data):
-                    old_value = self.all_config_data[row].get('stack_size', 0)
-                    self.all_config_data[row]['stack_size'] = new_value
+                table_to_data_map = getattr(self, '_table_to_data_map', {})
 
-                    # Mark as changed
-                    self.config_changes_made = True
-                    self.save_config_button.setEnabled(True)
+                if row in table_to_data_map:
+                    data_index = table_to_data_map[row]
+                    if data_index < len(self.all_config_data):
+                        old_value = self.all_config_data[data_index].get('stack_size', 0)
+                        self.all_config_data[data_index]['stack_size'] = new_value
 
-                    # Highlight changed row
-                    for col in range(self.config_table.columnCount()):
-                        cell_item = self.config_table.item(row, col)
-                        if cell_item:
-                            cell_item.setBackground(Qt.GlobalColor.yellow)
+                        # Mark as changed
+                        self.config_changes_made = True
+                        self.save_config_button.setEnabled(True)
 
-                    self.log_message(f"Changed {self.all_config_data[row]['name']} StackSize: {old_value} → {new_value}")
+                        # Highlight changed row with yellow background
+                        for col in range(self.config_table.columnCount()):
+                            cell_item = self.config_table.item(row, col)
+                            if cell_item:
+                                cell_item.setBackground(Qt.GlobalColor.yellow)
 
-            except ValueError:
+                        self.log_message(f"Changed {self.all_config_data[data_index]['name']} StackSize: {old_value} → {new_value}")
+                    else:
+                        self.log_message(f"Error: data_index {data_index} out of range for config data")
+                else:
+                    self.log_message(f"Error: row {row} not found in table mapping")
+
+            except ValueError as e:
+                self.log_message(f"Invalid StackSize value: {e}")
                 # Revert invalid changes
-                if row < len(self.all_config_data):
-                    item.setText(str(self.all_config_data[row].get('stack_size', 0)))
-                from PySide6.QtWidgets import QMessageBox
-                QMessageBox.warning(self, "Invalid Value", "StackSize must be a positive integer!")
+                row = item.row()
+                table_to_data_map = getattr(self, '_table_to_data_map', {})
+                if row in table_to_data_map:
+                    data_index = table_to_data_map[row]
+                    if data_index < len(self.all_config_data):
+                        item.setText(str(self.all_config_data[data_index].get('stack_size', 0)))
+                QMessageBox.warning(self, "Invalid Value", f"StackSize must be a positive integer!\nError: {e}")
 
     @Slot(str)
     def log_message(self, message):
@@ -396,7 +412,16 @@ class MainWindow(QMainWindow):
 
     @Slot(list)
     def update_config_table(self, config_items):
-        """Updates the config table with parsed config data in two sections."""
+        """Updates the config table with parsed config data."""
+        self.log_message(f"Updating config table with {len(config_items)} items")
+
+        if not config_items:
+            self.log_message("No config items received!")
+            return
+
+        # Temporarily disconnect the itemChanged signal to prevent auto-triggering
+        self.config_table.itemChanged.disconnect()
+
         self.all_config_data = config_items
         self.config_changes_made = False
         self.save_config_button.setEnabled(False)
@@ -413,77 +438,53 @@ class MainWindow(QMainWindow):
         template_names = ['FoodTemplate', 'OreTemplate', 'ComponentsTemplate']
 
         for item in config_items:
-            if item.get('name') in template_names:
+            item_name = item.get('name', '')
+            if item_name in template_names:
                 templates.append(item)
             else:
                 individuals.append(item)
 
-        # Count items that reference each template (for display)
-        template_counts = {}
-        for template in templates:
-            template_name = template['name']
-            # This is a simplified count - in reality you'd scan all items for Ref: usage
-            template_counts[template_name] = f"(template)"
+        self.log_message(f"Found {len(templates)} templates and {len(individuals)} individual items")
 
+        # Create mapping from table row to data index
+        self._table_to_data_map = {}
+
+        # Prepare table data
         self.config_table.setSortingEnabled(False)
         self.config_table.setRowCount(0)
 
-        all_rows = []
+        current_row = 0
 
-        # Add templates section
+        # Add templates section if we have any
         if templates:
-            # Add section header for templates
-            header_row = len(all_rows)
-            all_rows.append({
-                'type': 'TEMPLATES (affects multiple items)',
-                'name': '', 'stack_size': '', 'category': '', 'source_file': '',
-                'is_header': True
-            })
+            # Add one row for the header
+            self.config_table.setRowCount(current_row + 1)
 
+            # Section header - no special colors, just bold text
+            header_item = QTableWidgetItem("📋 TEMPLATES (affects multiple items)")
+            header_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.config_table.setItem(current_row, 0, header_item)
+
+            for col in range(1, 5):
+                empty_item = QTableWidgetItem("")
+                empty_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                self.config_table.setItem(current_row, col, empty_item)
+
+            current_row += 1
+
+            # Add template rows
             for template in templates:
-                template['type'] = f"📋 Template"
-                template['is_template'] = True
-                all_rows.append(template)
+                # Find this template in the original data
+                data_index = config_items.index(template)
 
-        # Add individuals section
-        if individuals:
-            # Add section header for individuals
-            header_row = len(all_rows)
-            all_rows.append({
-                'type': 'INDIVIDUAL ITEMS (custom values)',
-                'name': '', 'stack_size': '', 'category': '', 'source_file': '',
-                'is_header': True
-            })
+                self.config_table.setRowCount(current_row + 1)
+                self._table_to_data_map[current_row] = data_index
 
-            for individual in individuals:
-                individual['type'] = f"⚙️ Item"
-                individual['is_individual'] = True
-                all_rows.append(individual)
-
-        # Populate table
-        self.config_table.setRowCount(len(all_rows))
-        self.all_config_data = [row for row in all_rows if not row.get('is_header', False)]
-
-        for row, item in enumerate(all_rows):
-            if item.get('is_header', False):
-                # Header row
-                header_item = QTableWidgetItem(item['type'])
-                header_item.setBackground(Qt.GlobalColor.lightGray)
-                header_item.setFlags(Qt.ItemFlag.ItemIsEnabled)  # Not selectable/editable
-                self.config_table.setItem(row, 0, header_item)
-
-                for col in range(1, 5):
-                    empty_item = QTableWidgetItem("")
-                    empty_item.setBackground(Qt.GlobalColor.lightGray)
-                    empty_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
-                    self.config_table.setItem(row, col, empty_item)
-            else:
-                # Data row
-                type_item = QTableWidgetItem(item.get('type', ''))
-                name_item = QTableWidgetItem(item.get('name', ''))
-                stack_item = QTableWidgetItem(str(item.get('stack_size', '')))
-                category_item = QTableWidgetItem(item.get('category', ''))
-                source_item = QTableWidgetItem(item.get('source_file', ''))
+                type_item = QTableWidgetItem("📋 Template")
+                name_item = QTableWidgetItem(template.get('name', ''))
+                stack_item = QTableWidgetItem(str(template.get('stack_size', '')))
+                category_item = QTableWidgetItem(template.get('category', ''))
+                source_item = QTableWidgetItem(template.get('source_file', ''))
 
                 # Make only StackSize editable
                 type_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
@@ -492,21 +493,67 @@ class MainWindow(QMainWindow):
                 category_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
                 source_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
 
-                # Color code templates vs individuals
-                if item.get('is_template', False):
-                    type_item.setBackground(Qt.GlobalColor.lightBlue)
-                    name_item.setBackground(Qt.GlobalColor.lightBlue)
-                    stack_item.setBackground(Qt.GlobalColor.lightBlue)
-                    category_item.setBackground(Qt.GlobalColor.lightBlue)
-                    source_item.setBackground(Qt.GlobalColor.lightBlue)
+                self.config_table.setItem(current_row, 0, type_item)
+                self.config_table.setItem(current_row, 1, name_item)
+                self.config_table.setItem(current_row, 2, stack_item)
+                self.config_table.setItem(current_row, 3, category_item)
+                self.config_table.setItem(current_row, 4, source_item)
 
-                self.config_table.setItem(row, 0, type_item)
-                self.config_table.setItem(row, 1, name_item)
-                self.config_table.setItem(row, 2, stack_item)
-                self.config_table.setItem(row, 3, category_item)
-                self.config_table.setItem(row, 4, source_item)
+                current_row += 1
+
+        # Add individuals section if we have any
+        if individuals:
+            # Add one row for the header
+            self.config_table.setRowCount(current_row + 1)
+
+            # Section header - no special colors, just normal
+            header_item = QTableWidgetItem("⚙️ INDIVIDUAL ITEMS (custom values)")
+            header_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            self.config_table.setItem(current_row, 0, header_item)
+
+            for col in range(1, 5):
+                empty_item = QTableWidgetItem("")
+                empty_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+                self.config_table.setItem(current_row, col, empty_item)
+
+            current_row += 1
+
+            # Add individual item rows
+            for individual in individuals:
+                # Find this individual in the original data
+                data_index = config_items.index(individual)
+
+                self.config_table.setRowCount(current_row + 1)
+                self._table_to_data_map[current_row] = data_index
+
+                type_item = QTableWidgetItem("⚙️ Item")
+                name_item = QTableWidgetItem(individual.get('name', ''))
+                stack_item = QTableWidgetItem(str(individual.get('stack_size', '')))
+                category_item = QTableWidgetItem(individual.get('category', ''))
+                source_item = QTableWidgetItem(individual.get('source_file', ''))
+
+                # Make only StackSize editable
+                type_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                name_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                stack_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEditable)
+                category_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                source_item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+
+                self.config_table.setItem(current_row, 0, type_item)
+                self.config_table.setItem(current_row, 1, name_item)
+                self.config_table.setItem(current_row, 2, stack_item)
+                self.config_table.setItem(current_row, 3, category_item)
+                self.config_table.setItem(current_row, 4, source_item)
+
+                current_row += 1
 
         self.config_table.setSortingEnabled(True)
+
+        # Reconnect the itemChanged signal AFTER populating
+        self.config_table.itemChanged.connect(self.on_config_item_changed)
+
+        self.log_message(f"Config table updated successfully with {current_row} total rows")
+        self.log_message(f"Table to data mapping: {len(self._table_to_data_map)} entries")
 
     def filter_entities_table(self):
         """Hides or shows rows based on the content of all filter inputs."""

@@ -352,10 +352,25 @@ class Worker(QObject):
 
                 for filename, content in config_files.items():
                     self.logMessage.emit(f"Parsing {filename}...")
+
+                    # Debug: Show first few lines of the file
+                    lines = content.splitlines()[:10]
+                    self.logMessage.emit(f"First 10 lines of {filename}:")
+                    for i, line in enumerate(lines):
+                        self.logMessage.emit(f"  {i+1}: {line}")
+
                     items = self._parse_config_file(content, filename)
                     all_items.extend(items)
+                    self.logMessage.emit(f"Found {len(items)} items in {filename}")
 
-                self.logMessage.emit(f"Found {len(all_items)} items with StackSize across all files.")
+                self.logMessage.emit(f"Total found: {len(all_items)} items with StackSize across all files.")
+
+                # Debug: Show some sample items
+                if all_items:
+                    self.logMessage.emit("Sample items found:")
+                    for i, item in enumerate(all_items[:5]):
+                        self.logMessage.emit(f"  {i+1}: {item.get('name', 'Unknown')} - StackSize: {item.get('stack_size', 'None')}")
+
                 self.configDataUpdated.emit(all_items)
                 self.statusMessage.emit(f"Config loaded: {len(all_items)} items found.", 4000)
             else:
@@ -446,233 +461,7 @@ class Worker(QObject):
         in_item = False
 
         item_start_pattern = re.compile(r'^\s*{\s*(?:\+?)(?:Item|Block)\s+Id:\s*(\d+),\s*Name:\s*(\w+)', re.IGNORECASE)
-        stack_size_pattern = re.compile(r'^(\s*StackSize:\s*)(\d+)(.*)
-
-    def _download_all_ecf_files(self) -> Dict[str, str]:
-        """Downloads all .ecf files from the server via FTP."""
-        config_files = {}
-
-        try:
-            self.logMessage.emit(f"Connecting to FTP server {self.ftp_host}:{self.ftp_port}...")
-
-            # Connect to FTP server
-            ftp = FTP_TLS()
-            ftp.connect(self.ftp_host, self.ftp_port)
-            ftp.login(self.ftp_user, self.ftp_password)
-            ftp.prot_p()  # Enable secure data connection
-
-            # Change to the config directory
-            ftp.cwd(self.remote_config_path)
-            self.logMessage.emit(f"Changed to directory: {self.remote_config_path}")
-
-            # Get list of all files
-            files = ftp.nlst()
-            ecf_files = [f for f in files if f.lower().endswith('.ecf')]
-
-            if not ecf_files:
-                self.logMessage.emit("No .ecf files found in the directory.")
-                self.logMessage.emit(f"Available files: {', '.join(files)}")
-                ftp.quit()
-                return {}
-
-            self.logMessage.emit(f"Found {len(ecf_files)} .ecf files: {', '.join(ecf_files)}")
-
-            # Download each .ecf file
-            for filename in ecf_files:
-                try:
-                    self.logMessage.emit(f"Downloading {filename}...")
-                    config_data = io.BytesIO()
-                    ftp.retrbinary(f'RETR {filename}', config_data.write)
-
-                    # Convert to string
-                    content = config_data.getvalue().decode('utf-8', errors='ignore')
-                    config_files[filename] = content
-                    self.logMessage.emit(f"Downloaded {filename}: {len(content)} characters")
-
-                except Exception as e:
-                    self.logMessage.emit(f"Failed to download {filename}: {e}")
-                    continue
-
-            ftp.quit()
-            return config_files
-
-        except Exception as e:
-            self.logMessage.emit(f"FTP download error: {e}")
-            return {}
-
-    def _parse_config_file(self, content: str, filename: str) -> List[Dict]:
-        """Parses any .ecf file content and extracts items/blocks with StackSize."""
-        items = []
-        current_item = {}
-        in_item = False
-        item_content_lines = []
-
-        # Regex patterns for parsing both items and blocks
-        item_start_pattern = re.compile(r'^\s*{\s*(?:\+?)(?:Item|Block)\s+Id:\s*(\d+),\s*Name:\s*(\w+)', re.IGNORECASE)
-        stack_size_pattern = re.compile(r'^\s*StackSize:\s*(\d+)', re.IGNORECASE)
-        category_pattern = re.compile(r'^\s*Category:\s*(.+)', re.IGNORECASE)
-        show_user_pattern = re.compile(r'^\s*ShowUser:\s*(\w+)', re.IGNORECASE)
-        market_price_pattern = re.compile(r'^\s*MarketPrice:\s*(\d+)', re.IGNORECASE)
-        info_pattern = re.compile(r'^\s*Info:\s*([^,]+)', re.IGNORECASE)
-        item_end_pattern = re.compile(r'^\s*}')
-
-        for line in content.splitlines():
-            stripped_line = line.strip()
-
-            # Skip comments and empty lines
-            if not stripped_line or stripped_line.startswith('#'):
-                if in_item:
-                    item_content_lines.append(line)
-                continue
-
-            # Start of item/block
-            item_match = item_start_pattern.match(stripped_line)
-            if item_match:
-                current_item = {
-                    'id': item_match.group(1),
-                    'name': item_match.group(2),
-                    'category': 'Unknown',
-                    'show_user': True,
-                    'market_price': 0,
-                    'info': '',
-                    'source_file': filename
-                }
-                in_item = True
-                item_content_lines = [line]
-                continue
-
-            if in_item:
-                item_content_lines.append(line)
-
-                # StackSize
-                stack_match = stack_size_pattern.match(stripped_line)
-                if stack_match:
-                    current_item['stack_size'] = int(stack_match.group(1))
-                    continue
-
-                # Category
-                category_match = category_pattern.match(stripped_line)
-                if category_match:
-                    current_item['category'] = category_match.group(1).strip()
-                    continue
-
-                # ShowUser
-                show_user_match = show_user_pattern.match(stripped_line)
-                if show_user_match:
-                    show_user_value = show_user_match.group(1).lower()
-                    current_item['show_user'] = show_user_value in ['yes', 'true']
-                    continue
-
-                # MarketPrice
-                price_match = market_price_pattern.match(stripped_line)
-                if price_match:
-                    current_item['market_price'] = int(price_match.group(1))
-                    continue
-
-                # Info
-                info_match = info_pattern.match(stripped_line)
-                if info_match:
-                    current_item['info'] = info_match.group(1).strip()
-                    continue
-
-                # End of item/block
-                if item_end_pattern.match(stripped_line):
-                    in_item = False
-
-                    # Only add items that meet our criteria
-                    if self._should_include_item(current_item):
-                        # Store the original item content for later reconstruction
-                        current_item['original_content'] = '\n'.join(item_content_lines)
-                        items.append(current_item)
-
-                    current_item = {}
-                    item_content_lines = []
-
-        return items
-
-    def _should_include_item(self, item: Dict) -> bool:
-        """Determines if an item should be included in the editable list."""
-        # Must have StackSize
-        if 'stack_size' not in item:
-            return False
-
-        # Always include templates even if ShowUser: No
-        template_names = ['FoodTemplate', 'OreTemplate', 'ComponentsTemplate']
-        if item.get('name') in template_names:
-            return True
-
-        # Exclude items with ShowUser: No (unless they're templates)
-        if not item.get('show_user', True):
-            return False
-
-        # Include items with player-relevant categories
-        category = item.get('category', '').lower()
-        exclude_categories = [
-            'hidden', 'internal', 'system', 'debug'
-        ]
-
-        for cat in exclude_categories:
-            if cat in category:
-                return False
-
-        # Exclude obvious system/internal items by name
-        item_name = item.get('name', '').lower()
-        exclude_patterns = [
-            'poi', 'planet', 'enemy', 'legacy', 'temp', 'debug', 'test'
-        ]
-
-        for pattern in exclude_patterns:
-            if pattern in item_name:
-                return False
-
-        # Include player-usable items
-        include_categories = [
-            'food', 'weapon', 'device', 'component', 'ingredient',
-            'resource', 'tool', 'equipment', 'ammunition', 'fuel'
-        ]
-
-        for cat in include_categories:
-            if cat in category:
-                return True
-
-        # Default to include if we can't determine otherwise
-        return True
-
-    # --- Player action slots ---
-    @Slot(str)
-    def send_global_message(self, message: str):
-        if not message: return
-        self.send_command(f"say '{message}'")
-    @Slot()
-    def save_server(self):
-        self.send_command("save")
-    @Slot(str, str)
-    def kick_player(self, player_name: str, reason: str):
-        if not player_name: return
-        reason_text = reason if reason else "N/A"
-        command = f"kick '{player_name}' '{reason_text}'"
-        self.send_command(command)
-
-    @Slot(str)
-    def ban_player(self, player_id: str):
-        """Bans a player by their ID for 1 hour."""
-        if not player_id: return
-        command = f"ban {player_id} 1h"
-        self.send_command(command)
-        self.logMessage.emit(f"Ban command sent for ID: {player_id} (1 hour)")
-
-    @Slot(str)
-    def unban_player(self, player_id: str):
-        """Unbans a player by their ID."""
-        if not player_id: return
-        command = f"unban {player_id}"
-        self.send_command(command)
-        self.logMessage.emit(f"Unban command sent for ID: {player_id}")
-
-    @Slot(str, str)
-    def send_private_message(self, player_name: str, message: str):
-        if not player_name or not message: return
-        self.send_command(f"pm '{player_name}' '{message}'"), re.IGNORECASE)
+        stack_size_pattern = re.compile(r'^(\s*StackSize:\s*)(\d+)(.*)', re.IGNORECASE)
         item_end_pattern = re.compile(r'^\s*}')
 
         for line in lines:
@@ -714,7 +503,7 @@ class Worker(QObject):
         return '\n'.join(modified_lines)
 
     def _backup_and_upload_file(self, filename: str, new_content: str) -> bool:
-        """Creates backup and uploads the modified file."""
+        """Creates backup and uploads the modified file with improved backup strategy."""
         try:
             ftp = FTP_TLS()
             ftp.connect(self.ftp_host, self.ftp_port)
@@ -723,17 +512,46 @@ class Worker(QObject):
 
             ftp.cwd(self.remote_config_path)
 
-            # Create backup filename
+            # Get list of existing files
+            existing_files = ftp.nlst()
+
+            original_filename = f"{filename}.org"
             backup_filename = f"{filename}.bak"
 
-            # Rename original to backup
+            # Step 1: Create .org file if it doesn't exist (first-time original backup)
+            if original_filename not in existing_files:
+                try:
+                    # Copy current file to .org (permanent original)
+                    ftp.rename(filename, original_filename)
+                    self.logMessage.emit(f"Created original backup: {original_filename}")
+
+                    # Download the .org file content to use as current file
+                    original_data = io.BytesIO()
+                    ftp.retrbinary(f'RETR {original_filename}', original_data.write)
+
+                    # Re-upload it as the current file so we can make a .bak copy
+                    original_content_io = io.BytesIO(original_data.getvalue())
+                    ftp.storbinary(f'STOR {filename}', original_content_io)
+                    self.logMessage.emit(f"Restored current file: {filename}")
+
+                except Exception as e:
+                    self.logMessage.emit(f"Warning: Could not create original backup {original_filename}: {e}")
+
+            # Step 2: Create/overwrite .bak file (previous version backup)
             try:
+                # If .bak already exists, delete it first
+                if backup_filename in existing_files:
+                    ftp.delete(backup_filename)
+                    self.logMessage.emit(f"Removed old backup: {backup_filename}")
+
+                # Rename current file to .bak
                 ftp.rename(filename, backup_filename)
                 self.logMessage.emit(f"Created backup: {backup_filename}")
+
             except Exception as e:
                 self.logMessage.emit(f"Warning: Could not create backup {backup_filename}: {e}")
 
-            # Upload new content
+            # Step 3: Upload new content as current file
             new_content_bytes = new_content.encode('utf-8')
             content_io = io.BytesIO(new_content_bytes)
 
@@ -804,133 +622,82 @@ class Worker(QObject):
         items = []
         current_item = {}
         in_item = False
-        item_content_lines = []
+        line_number = 0
 
-        # Regex patterns for parsing both items and blocks
-        item_start_pattern = re.compile(r'^\s*{\s*(?:\+?)(?:Item|Block)\s+Id:\s*(\d+),\s*Name:\s*(\w+)', re.IGNORECASE)
+        # More flexible regex patterns
+        item_start_pattern = re.compile(r'^\s*{\s*(?:\+?)(?:Item|Block)\s+Id:\s*(\d+),?\s*Name:\s*(\w+)', re.IGNORECASE)
         stack_size_pattern = re.compile(r'^\s*StackSize:\s*(\d+)', re.IGNORECASE)
-        category_pattern = re.compile(r'^\s*Category:\s*(.+)', re.IGNORECASE)
+        category_pattern = re.compile(r'^\s*Category:\s*(.+?)(?:,|$)', re.IGNORECASE)
         show_user_pattern = re.compile(r'^\s*ShowUser:\s*(\w+)', re.IGNORECASE)
-        market_price_pattern = re.compile(r'^\s*MarketPrice:\s*(\d+)', re.IGNORECASE)
-        info_pattern = re.compile(r'^\s*Info:\s*([^,]+)', re.IGNORECASE)
         item_end_pattern = re.compile(r'^\s*}')
 
         for line in content.splitlines():
+            line_number += 1
             stripped_line = line.strip()
 
             # Skip comments and empty lines
             if not stripped_line or stripped_line.startswith('#'):
-                if in_item:
-                    item_content_lines.append(line)
                 continue
 
             # Start of item/block
-            item_match = item_start_pattern.match(stripped_line)
+            item_match = item_start_pattern.match(line)
             if item_match:
                 current_item = {
                     'id': item_match.group(1),
                     'name': item_match.group(2),
                     'category': 'Unknown',
                     'show_user': True,
-                    'market_price': 0,
-                    'info': '',
-                    'source_file': filename
+                    'source_file': filename,
+                    'line_number': line_number
                 }
                 in_item = True
-                item_content_lines = [line]
+                self.logMessage.emit(f"Line {line_number}: Found item start: {current_item['name']} (ID: {current_item['id']})")
                 continue
 
             if in_item:
-                item_content_lines.append(line)
-
                 # StackSize
-                stack_match = stack_size_pattern.match(stripped_line)
+                stack_match = stack_size_pattern.match(line)
                 if stack_match:
-                    current_item['stack_size'] = int(stack_match.group(1))
+                    try:
+                        stack_value = int(stack_match.group(1))
+                        current_item['stack_size'] = stack_value
+                        self.logMessage.emit(f"Line {line_number}: Found StackSize: {stack_value} for {current_item.get('name', 'Unknown')}")
+                    except ValueError as e:
+                        self.logMessage.emit(f"Line {line_number}: Error parsing StackSize '{stack_match.group(1)}': {e}")
                     continue
 
                 # Category
-                category_match = category_pattern.match(stripped_line)
+                category_match = category_pattern.match(line)
                 if category_match:
                     current_item['category'] = category_match.group(1).strip()
                     continue
 
                 # ShowUser
-                show_user_match = show_user_pattern.match(stripped_line)
+                show_user_match = show_user_pattern.match(line)
                 if show_user_match:
                     show_user_value = show_user_match.group(1).lower()
-                    current_item['show_user'] = show_user_value in ['yes', 'true']
-                    continue
-
-                # MarketPrice
-                price_match = market_price_pattern.match(stripped_line)
-                if price_match:
-                    current_item['market_price'] = int(price_match.group(1))
-                    continue
-
-                # Info
-                info_match = info_pattern.match(stripped_line)
-                if info_match:
-                    current_item['info'] = info_match.group(1).strip()
+                    current_item['show_user'] = show_user_value in ['yes', 'true', '1']
                     continue
 
                 # End of item/block
-                if item_end_pattern.match(stripped_line):
+                if item_end_pattern.match(line):
                     in_item = False
 
-                    # Only add items that meet our criteria
-                    if self._should_include_item(current_item):
-                        # Store the original item content for later reconstruction
-                        current_item['original_content'] = '\n'.join(item_content_lines)
-                        items.append(current_item)
+                    # Add items that have StackSize
+                    if 'stack_size' in current_item:
+                        items.append(current_item.copy())
+                        self.logMessage.emit(f"Line {line_number}: Added item: {current_item['name']} (StackSize: {current_item['stack_size']})")
+                    else:
+                        self.logMessage.emit(f"Line {line_number}: Skipped item {current_item.get('name', 'Unknown')} - no StackSize found")
 
                     current_item = {}
-                    item_content_lines = []
 
+        self.logMessage.emit(f"Parsing complete for {filename}: {len(items)} items found")
         return items
 
     def _should_include_item(self, item: Dict) -> bool:
-        """Determines if an item should be included in the editable list."""
-        # Must have StackSize
-        if 'stack_size' not in item:
-            return False
-
-        # Exclude items with ShowUser: No
-        if not item.get('show_user', True):
-            return False
-
-        # Include items with player-relevant categories
-        category = item.get('category', '').lower()
-        exclude_categories = [
-            'hidden', 'internal', 'system', 'debug'
-        ]
-
-        for cat in exclude_categories:
-            if cat in category:
-                return False
-
-        # Exclude obvious system/internal items by name
-        item_name = item.get('name', '').lower()
-        exclude_patterns = [
-            'poi', 'planet', 'enemy', 'legacy', 'temp', 'debug', 'test'
-        ]
-
-        for pattern in exclude_patterns:
-            if pattern in item_name:
-                return False
-
-        # Include player-usable items
-        include_categories = [
-            'food', 'weapon', 'device', 'component', 'ingredient',
-            'resource', 'tool', 'equipment', 'ammunition', 'fuel'
-        ]
-
-        for cat in include_categories:
-            if cat in category:
-                return True
-
-        # Default to include if we can't determine otherwise
-        return True
+        """Simple inclusion - just check if it has StackSize."""
+        return 'stack_size' in item
 
     # --- Player action slots ---
     @Slot(str)
