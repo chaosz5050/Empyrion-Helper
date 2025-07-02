@@ -2,7 +2,7 @@
 
 A comprehensive administration tool for Empyrion: Galactic Survival dedicated servers. Monitor players, manage entities, and edit game configurations in real-time through an intuitive GUI interface.
 
-![Empyrion Server Helper](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-blue)
+![Empyrion Server Helper](https://img.shields.io/badge/Platform-Linux-blue)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-green)
 ![License](https://img.shields.io/badge/License-MIT-yellow)
 
@@ -48,14 +48,27 @@ A comprehensive administration tool for Empyrion: Galactic Survival dedicated se
    cd empyrion-server-helper
    ```
 
-2. Install dependencies:
+2. Create and activate a virtual environment:
+   ```bash
+   # Create virtual environment
+   python3 -m venv venv
+   
+   # Activate virtual environment
+   # For bash/zsh:
+   source venv/bin/activate
+   
+   # For fish shell:
+   source venv/bin/activate.fish
+   ```
+
+3. Install dependencies:
    ```bash
    pip install -r requirements.txt
    ```
 
-3. Create your configuration file (see Configuration section below)
+4. Create your configuration file (see Configuration section below)
 
-4. Run the application:
+5. Run the application:
    ```bash
    python main_app.py
    ```
@@ -157,7 +170,7 @@ empyrion-server-helper/
 ## Requirements
 
 ### System Requirements
-- **OS**: Windows 10+, Linux, macOS
+- **OS**: Linux distributions
 - **Python**: 3.8 or higher
 - **RAM**: 512MB minimum
 - **Network**: Access to Empyrion server ports
