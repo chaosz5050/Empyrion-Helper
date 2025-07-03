@@ -11,6 +11,7 @@ from ftplib import FTP_TLS, error_perm
 import io
 
 from PySide6.QtCore import QObject, Signal, Slot, QTimer
+from datetime import datetime, timedelta
 
 class Worker(QObject):
     # Signals that the worker can send to the GUI
@@ -21,6 +22,7 @@ class Worker(QObject):
     entitiesUpdated = Signal(list)
     configDataUpdated = Signal(list)
     statusMessage = Signal(str, int) # message, timeout (in ms)
+    scheduledMessagesLoaded = Signal(list)
 
     def __init__(self, config_file="empyrion_helper.conf"):
         super().__init__()
@@ -55,6 +57,12 @@ class Worker(QObject):
         # --- QTimer for periodic updates ---
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.force_player_update)
+
+        # --- QTimer for scheduled messages ---
+        self.message_timer = QTimer(self)
+        self.message_timer.timeout.connect(self.check_scheduled_messages)
+        self.scheduled_messages = []
+        self.last_message_check = {}
 
         self._init_database()
 
@@ -124,9 +132,13 @@ class Worker(QObject):
         self.force_player_update()
         self.timer.start(self.update_interval * 1000)
 
+        # Start message timer (check every minute)
+        self.message_timer.start(60000)  # 60 seconds
+
     @Slot()
     def stop_monitoring(self):
         self.timer.stop() # Stop the timer
+        self.message_timer.stop() # Stop message timer
         self._running = False
         if self.socket:
             try:
@@ -703,6 +715,7 @@ class Worker(QObject):
     @Slot(str)
     def send_global_message(self, message: str):
         if not message: return
+        # Use single quotes - this works for multi-word messages
         self.send_command(f"say '{message}'")
     @Slot()
     def save_server(self):
@@ -734,3 +747,146 @@ class Worker(QObject):
     def send_private_message(self, player_name: str, message: str):
         if not player_name or not message: return
         self.send_command(f"pm '{player_name}' '{message}'")
+
+    # --- Scheduled Messages functionality ---
+    @Slot(list)
+    def save_scheduled_messages(self, messages_data):
+        """Save scheduled messages to config file."""
+        try:
+            # Update the config object
+            if not self.config.has_section('scheduled_messages'):
+                self.config.add_section('scheduled_messages')
+
+            # Clear existing messages
+            for option in self.config.options('scheduled_messages'):
+                self.config.remove_option('scheduled_messages', option)
+
+            # Save new messages
+            for i, msg_data in enumerate(messages_data):
+                prefix = f"message{i+1}"
+                self.config.set('scheduled_messages', f"{prefix}_enabled", str(msg_data['enabled']).lower())
+                self.config.set('scheduled_messages', f"{prefix}_text", msg_data['text'])
+                self.config.set('scheduled_messages', f"{prefix}_schedule", msg_data['schedule'])
+
+            # Write to file
+            with open("empyrion_helper.conf", 'w') as configfile:
+                self.config.write(configfile)
+
+            # Reload scheduled messages
+            self._load_scheduled_messages_from_config()
+
+            self.logMessage.emit("Scheduled messages saved successfully!")
+            self.statusMessage.emit("Scheduled messages saved!", 3000)
+
+        except Exception as e:
+            self.logMessage.emit(f"Error saving scheduled messages: {e}")
+            self.statusMessage.emit("Error saving scheduled messages.", 3000)
+
+    @Slot()
+    def load_scheduled_messages(self):
+        """Load scheduled messages from config file and emit to UI."""
+        self._load_scheduled_messages_from_config()
+
+        # Convert to UI format
+        ui_messages = []
+        for i in range(5):
+            prefix = f"message{i+1}"
+            enabled = self.config.getboolean('scheduled_messages', f"{prefix}_enabled", fallback=False)
+            text = self.config.get('scheduled_messages', f"{prefix}_text", fallback='')
+            schedule = self.config.get('scheduled_messages', f"{prefix}_schedule", fallback='Every 5 minutes')
+
+            ui_messages.append({
+                'enabled': enabled,
+                'text': text,
+                'schedule': schedule
+            })
+
+        self.scheduledMessagesLoaded.emit(ui_messages)
+        self.logMessage.emit("Scheduled messages loaded from config file.")
+
+    def _load_scheduled_messages_from_config(self):
+        """Internal method to load scheduled messages into worker."""
+        self.scheduled_messages = []
+
+        if not self.config.has_section('scheduled_messages'):
+            return
+
+        for i in range(5):
+            prefix = f"message{i+1}"
+            enabled = self.config.getboolean('scheduled_messages', f"{prefix}_enabled", fallback=False)
+            text = self.config.get('scheduled_messages', f"{prefix}_text", fallback='')
+            schedule = self.config.get('scheduled_messages', f"{prefix}_schedule", fallback='Every 5 minutes')
+
+            if enabled and text.strip():
+                self.scheduled_messages.append({
+                    'id': i+1,
+                    'text': text,
+                    'schedule': schedule,
+                    'enabled': enabled
+                })
+
+        # Reset last check times
+        self.last_message_check = {}
+
+    @Slot()
+    def check_scheduled_messages(self):
+        """Check if any scheduled messages need to be sent."""
+        if not self.connected or not self.scheduled_messages:
+            return
+
+        current_time = datetime.now()
+
+        for msg in self.scheduled_messages:
+            if not msg['enabled']:
+                continue
+
+            msg_id = msg['id']
+            schedule = msg['schedule']
+
+            # Check if it's time to send this message
+            if self._should_send_message(msg_id, schedule, current_time):
+                self.send_global_message(msg['text'])
+                self.logMessage.emit(f"Sent scheduled message {msg_id}: {msg['text'][:50]}...")
+                self.last_message_check[msg_id] = current_time
+
+    def _should_send_message(self, msg_id, schedule, current_time):
+        """Determine if a scheduled message should be sent now."""
+        last_sent = self.last_message_check.get(msg_id)
+
+        if schedule.startswith("Every"):
+            # Parse interval schedules
+            if "minute" in schedule:
+                try:
+                    minutes = int(schedule.split()[1])
+                    if last_sent is None:
+                        return True  # Send immediately if never sent
+                    return (current_time - last_sent).total_seconds() >= minutes * 60
+                except:
+                    return False
+
+            elif "hour" in schedule:
+                try:
+                    hours = int(schedule.split()[1])
+                    if last_sent is None:
+                        return True  # Send immediately if never sent
+                    return (current_time - last_sent).total_seconds() >= hours * 3600
+                except:
+                    return False
+
+        elif schedule.startswith("Daily at"):
+            # Parse daily schedules
+            try:
+                time_str = schedule.split("at")[1].strip()
+                target_hour, target_minute = map(int, time_str.split(":"))
+
+                # Check if we're at the target time (within current minute)
+                if current_time.hour == target_hour and current_time.minute == target_minute:
+                    # Only send once per day
+                    if last_sent is None:
+                        return True
+                    return (current_time - last_sent).days >= 1
+                return False
+            except:
+                return False
+
+        return False

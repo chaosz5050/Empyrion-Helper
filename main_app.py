@@ -5,14 +5,14 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                                QPushButton, QTabWidget, QTextEdit, QLabel,
                                QLineEdit, QHBoxLayout, QFormLayout, QTableWidget,
                                QTableWidgetItem, QMenu, QInputDialog, QHeaderView,
-                               QComboBox, QStatusBar, QMessageBox)
+                               QComboBox, QStatusBar, QMessageBox, QCheckBox)
 from PySide6.QtCore import QThread, Slot, Qt
 from backend import Worker
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Empyrion Server Helper")
+        self.setWindowTitle("Empyrion Server Helper v0.2.0-alpha")
         self.setGeometry(100, 100, 900, 700)
 
         self.thread = None
@@ -26,11 +26,17 @@ class MainWindow(QMainWindow):
         self.create_dashboard_tab()
         self.create_entities_tab()
         self.create_config_editor_tab()
+        self.create_scheduled_messages_tab()
 
         self.statusBar = QStatusBar()
         self.setStatusBar(self.statusBar)
         self.permanent_status_label = QLabel("Status: Not Connected")
         self.statusBar.addPermanentWidget(self.permanent_status_label)
+
+        # Load autoconnect setting and connect if enabled (after all tabs are created)
+        self.load_autoconnect_setting()
+        if self.autoconnect_checkbox.isChecked():
+            self.start_worker()
 
     def create_dashboard_tab(self):
         dashboard_widget = QWidget()
@@ -38,11 +44,15 @@ class MainWindow(QMainWindow):
 
         # --- Connection Controls ---
         control_layout = QHBoxLayout()
-        self.connect_button = QPushButton("Connect and Start Monitoring")
+        self.connect_button = QPushButton("Connect")
         self.disconnect_button = QPushButton("Disconnect")
         self.disconnect_button.setEnabled(False)
+        self.autoconnect_checkbox = QCheckBox("Autoconnect")
+        self.autoconnect_checkbox.stateChanged.connect(self.on_autoconnect_changed)
+
         control_layout.addWidget(self.connect_button)
         control_layout.addWidget(self.disconnect_button)
+        control_layout.addWidget(self.autoconnect_checkbox)
         control_layout.addStretch()
 
         # --- Player Table ---
@@ -68,11 +78,7 @@ class MainWindow(QMainWindow):
 
         # --- Server Actions ---
         actions_layout = QFormLayout()
-        self.message_input = QLineEdit()
-        self.send_message_button = QPushButton("Send Global Message")
         self.save_button = QPushButton("Save Server")
-        actions_layout.addRow("Message:", self.message_input)
-        actions_layout.addRow(self.send_message_button)
         actions_layout.addRow(self.save_button)
 
         # --- Log venster ---
@@ -189,6 +195,145 @@ class MainWindow(QMainWindow):
         # Track changes
         self.config_changes_made = False
 
+    def create_scheduled_messages_tab(self):
+        """Creates the tab for managing scheduled global messages."""
+        messages_widget = QWidget()
+        layout = QVBoxLayout(messages_widget)
+
+        # Manual message section
+        manual_layout = QFormLayout()
+        manual_layout.addWidget(QLabel("Manual Global Message:"))
+
+        manual_input_layout = QHBoxLayout()
+        self.manual_message_input = QLineEdit()
+        self.manual_message_input.setPlaceholderText("Enter message to send immediately...")
+        self.send_manual_message_button = QPushButton("Send Global Message")
+        manual_input_layout.addWidget(self.manual_message_input)
+        manual_input_layout.addWidget(self.send_manual_message_button)
+        manual_layout.addRow(manual_input_layout)
+
+        layout.addLayout(manual_layout)
+
+        # Separator
+        layout.addWidget(QLabel(""))
+        layout.addWidget(QLabel("Scheduled Messages:"))
+
+        # Scheduled messages section
+        self.scheduled_messages = []
+
+        for i in range(5):
+            message_layout = QHBoxLayout()
+
+            # Enable checkbox
+            enabled_checkbox = QCheckBox(f"Message {i+1}:")
+            enabled_checkbox.stateChanged.connect(lambda state, idx=i: self.on_message_enabled_changed(idx, state))
+
+            # Message text input
+            message_input = QLineEdit()
+            message_input.setPlaceholderText("Enter scheduled message...")
+            message_input.textChanged.connect(lambda text, idx=i: self.on_message_text_changed(idx, text))
+
+            # Schedule type combo
+            schedule_combo = QComboBox()
+            schedule_combo.addItems([
+                "Every 5 minutes", "Every 10 minutes", "Every 15 minutes", "Every 30 minutes",
+                "Every 1 hour", "Every 2 hours", "Every 3 hours", "Every 6 hours", "Every 12 hours",
+                "Daily at 08:00", "Daily at 12:00", "Daily at 18:00", "Daily at 20:00", "Custom..."
+            ])
+            schedule_combo.currentTextChanged.connect(lambda text, idx=i: self.on_schedule_changed(idx, text))
+
+            # Delete button
+            delete_button = QPushButton("Delete")
+            delete_button.clicked.connect(lambda checked, idx=i: self.on_delete_message(idx))
+
+            message_layout.addWidget(enabled_checkbox)
+            message_layout.addWidget(message_input)
+            message_layout.addWidget(schedule_combo)
+            message_layout.addWidget(delete_button)
+
+            layout.addLayout(message_layout)
+
+            # Store references
+            self.scheduled_messages.append({
+                'enabled_checkbox': enabled_checkbox,
+                'message_input': message_input,
+                'schedule_combo': schedule_combo,
+                'delete_button': delete_button
+            })
+
+        # Control buttons
+        control_layout = QHBoxLayout()
+        self.save_schedule_button = QPushButton("Save Schedule Configuration")
+        self.load_schedule_button = QPushButton("Load Schedule Configuration")
+        control_layout.addWidget(self.load_schedule_button)
+        control_layout.addWidget(self.save_schedule_button)
+        control_layout.addStretch()
+
+        layout.addLayout(control_layout)
+        layout.addStretch()
+
+        self.tabs.addTab(messages_widget, "Scheduled Messages")
+
+    def on_message_enabled_changed(self, index, state):
+        """Called when a scheduled message is enabled/disabled."""
+        enabled = state == Qt.CheckState.Checked.value
+        self.log_message(f"Message {index+1} {'enabled' if enabled else 'disabled'}")
+
+    def on_message_text_changed(self, index, text):
+        """Called when message text changes."""
+        pass  # We'll save when user clicks save button
+
+    def on_schedule_changed(self, index, schedule_text):
+        """Called when schedule type changes."""
+        self.log_message(f"Message {index+1} schedule changed to: {schedule_text}")
+
+    def on_delete_message(self, index):
+        """Called when delete button is clicked."""
+        reply = QMessageBox.question(self, "Delete Message",
+                                   f"Are you sure you want to delete Message {index+1}?",
+                                   QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply == QMessageBox.StandardButton.Yes:
+            # Clear the message
+            msg = self.scheduled_messages[index]
+            msg['enabled_checkbox'].setChecked(False)
+            msg['message_input'].clear()
+            msg['schedule_combo'].setCurrentIndex(0)
+            self.log_message(f"Message {index+1} deleted")
+
+    def on_save_schedule_clicked(self):
+        """Save scheduled messages to config file."""
+        if self.worker:
+            self.worker.save_scheduled_messages(self.get_scheduled_messages_data())
+
+    def on_load_schedule_clicked(self):
+        """Load scheduled messages from config file."""
+        if self.worker:
+            self.worker.load_scheduled_messages()
+
+    def get_scheduled_messages_data(self):
+        """Get current scheduled messages data from UI."""
+        messages_data = []
+        for i, msg in enumerate(self.scheduled_messages):
+            data = {
+                'enabled': msg['enabled_checkbox'].isChecked(),
+                'text': msg['message_input'].text(),
+                'schedule': msg['schedule_combo'].currentText()
+            }
+            messages_data.append(data)
+        return messages_data
+
+    def update_scheduled_messages_ui(self, messages_data):
+        """Update UI with loaded scheduled messages data."""
+        for i, data in enumerate(messages_data):
+            if i < len(self.scheduled_messages):
+                msg = self.scheduled_messages[i]
+                msg['enabled_checkbox'].setChecked(data.get('enabled', False))
+                msg['message_input'].setText(data.get('text', ''))
+                schedule_text = data.get('schedule', 'Every 5 minutes')
+                index = msg['schedule_combo'].findText(schedule_text)
+                if index >= 0:
+                    msg['schedule_combo'].setCurrentIndex(index)
+
     def start_worker(self):
         self.thread = QThread()
         self.worker = Worker()
@@ -200,15 +345,18 @@ class MainWindow(QMainWindow):
         self.worker.entitiesUpdated.connect(self.update_entities_table)
         self.worker.configDataUpdated.connect(self.update_config_table)
         self.worker.statusMessage.connect(self.show_temporary_status)
+        self.worker.scheduledMessagesLoaded.connect(self.update_scheduled_messages_ui)
 
         self.thread.started.connect(self.worker.start_monitoring)
-        self.send_message_button.clicked.connect(lambda: self.worker.send_global_message(self.message_input.text()))
         self.save_button.clicked.connect(self.worker.save_server)
         self.refresh_players_button.clicked.connect(self.worker.force_player_update)
         self.load_entities_button.clicked.connect(self.on_load_entities_clicked)
         self.save_raw_gents_button.clicked.connect(self.on_save_raw_gents_clicked)
         self.load_config_button.clicked.connect(self.on_load_config_clicked)
         self.save_config_button.clicked.connect(self.on_save_config_clicked)
+        self.send_manual_message_button.clicked.connect(lambda: self.worker.send_global_message(self.manual_message_input.text()))
+        self.save_schedule_button.clicked.connect(self.on_save_schedule_clicked)
+        self.load_schedule_button.clicked.connect(self.on_load_schedule_clicked)
 
         self.thread.start()
         self.connect_button.setEnabled(False)
@@ -345,6 +493,46 @@ class MainWindow(QMainWindow):
                     if data_index < len(self.all_config_data):
                         item.setText(str(self.all_config_data[data_index].get('stack_size', 0)))
                 QMessageBox.warning(self, "Invalid Value", f"StackSize must be a positive integer!\nError: {e}")
+
+    def on_autoconnect_changed(self, state):
+        """Called when autoconnect checkbox state changes."""
+        enabled = state == Qt.CheckState.Checked.value
+        self.save_autoconnect_setting(enabled)
+        self.log_message(f"Autoconnect {'enabled' if enabled else 'disabled'}")
+
+    def load_autoconnect_setting(self):
+        """Load autoconnect setting from config file."""
+        try:
+            import configparser
+            config = configparser.ConfigParser()
+            config.read("empyrion_helper.conf")
+
+            autoconnect = config.getboolean('general', 'autoconnect', fallback=False)
+            self.autoconnect_checkbox.setChecked(autoconnect)
+
+        except Exception as e:
+            self.log_message(f"Could not load autoconnect setting: {e}")
+            self.autoconnect_checkbox.setChecked(False)
+
+    def save_autoconnect_setting(self, enabled):
+        """Save autoconnect setting to config file."""
+        try:
+            import configparser
+            config = configparser.ConfigParser()
+            config.read("empyrion_helper.conf")
+
+            if not config.has_section('general'):
+                config.add_section('general')
+
+            config.set('general', 'autoconnect', str(enabled).lower())
+
+            with open("empyrion_helper.conf", 'w') as configfile:
+                config.write(configfile)
+
+            self.log_message("Autoconnect setting saved.")
+
+        except Exception as e:
+            self.log_message(f"Could not save autoconnect setting: {e}")
 
     @Slot(str)
     def log_message(self, message):
