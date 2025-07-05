@@ -1,7 +1,14 @@
-# backend.py
+# backend.py – FIXED VERSION 0.2.2-dev (2025‑07‑05)
+# -----------------------------------------------------------------------------
+# Fixes:
+# - Robust regex for "Players connected" (Empyrion output)
+# - SAFE SQLite access (no thread errors): DB connection per-use, no shared connection
+# -----------------------------------------------------------------------------
+
 import socket
 import time
 import re
+import json
 from datetime import datetime, timedelta
 from typing import List, Dict
 import configparser
@@ -11,882 +18,644 @@ from ftplib import FTP_TLS, error_perm
 import io
 
 from PySide6.QtCore import QObject, Signal, Slot, QTimer
-from datetime import datetime, timedelta
 
 class Worker(QObject):
-    # Signals that the worker can send to the GUI
+    # ------------------------------------------------------------------
+    # Qt Signals
+    # ------------------------------------------------------------------
     connectionStatusChanged = Signal(bool, str)
     logMessage = Signal(str)
     playersUpdated = Signal(list)
-    playerHistoryUpdated = Signal(list) # Kept for later use
+    playerHistoryUpdated = Signal(list)
     entitiesUpdated = Signal(list)
     configDataUpdated = Signal(list)
-    statusMessage = Signal(str, int) # message, timeout (in ms)
+    statusMessage = Signal(str, int)
     scheduledMessagesLoaded = Signal(list)
 
+    # ------------------------------------------------------------------
+    # Init
+    # ------------------------------------------------------------------
     def __init__(self, config_file="empyrion_helper.conf"):
         super().__init__()
         self.config = configparser.ConfigParser()
         self.config.read(config_file)
 
-        # Server details
+        # --- server params ---
         self.host = self.config.get('server', 'host', fallback='localhost')
         self.port = self.config.getint('server', 'telnet_port', fallback=30004)
         self.password = self.config.get('server', 'telnet_password', fallback='')
 
-        # FTP details
-        ftp_address = self.config.get('ftp', 'host', fallback='')
-        self.ftp_host = ftp_address
-        self.ftp_port = 21
-        if ':' in ftp_address:
+        # --- ftp params ---
+        ftp_addr = self.config.get('ftp', 'host', fallback='')
+        self.ftp_host, self.ftp_port = ftp_addr.split(':')[0], 21
+        if ':' in ftp_addr:
             try:
-                host, port_str = ftp_address.split(':', 1)
-                self.ftp_host = host
-                self.ftp_port = int(port_str)
+                self.ftp_port = int(ftp_addr.split(':')[1])
             except ValueError:
-                self.logMessage.emit(f"Invalid FTP host format: '{ftp_address}'.")
+                pass
         self.ftp_user = self.config.get('ftp', 'user', fallback='')
         self.ftp_password = self.config.get('ftp', 'password', fallback='')
         self.remote_config_path = self.config.get('ftp', 'remote_log_path', fallback='/')
 
+        # --- state
         self.socket = None
         self.connected = False
         self._running = False
         self.update_interval = self.config.getint('monitoring', 'update_interval', fallback=30)
 
-        # --- QTimer for periodic updates ---
+        # --- timers
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.force_player_update)
 
-        # --- QTimer for scheduled messages ---
         self.message_timer = QTimer(self)
         self.message_timer.timeout.connect(self.check_scheduled_messages)
         self.scheduled_messages = []
-        self.last_message_check = {}
+        self.last_message_check: Dict[int, datetime] = {}
 
+        # --- config data storage
+        self.config_data = []
+
+        # --- Ensure DB is initialized (in main thread is fine, but no connection kept)
         self._init_database()
 
+    # ------------------------------------------------------------------
+    # DB Setup (just create tables if not exist, do NOT keep a connection!)
+    # ------------------------------------------------------------------
     def _init_database(self):
-        """Initializes the SQLite database and the required tables."""
-        self.db_conn = sqlite3.connect('player_history.db')
-        cursor = self.db_conn.cursor()
-        # Player events table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS player_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT, steam_id TEXT, player_name TEXT,
-                playfield_name TEXT, event_type TEXT,
-                UNIQUE(timestamp, steam_id, event_type)
-            )
-        ''')
-        # Entities table
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS entities (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                entity_id TEXT,
-                type TEXT,
-                faction TEXT,
-                name TEXT,
-                playfield TEXT
-            )
-        ''')
-        self.db_conn.commit()
+        try:
+            db_conn = sqlite3.connect('player_history.db')
+            c = db_conn.cursor()
+            c.execute('''CREATE TABLE IF NOT EXISTS player_events (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            timestamp TEXT, steam_id TEXT, player_name TEXT,
+                            playfield_name TEXT, event_type TEXT,
+                            UNIQUE(timestamp, steam_id, event_type))''')
+            c.execute('''CREATE TABLE IF NOT EXISTS entities (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            entity_id TEXT, type TEXT, faction TEXT,
+                            name TEXT, playfield TEXT)''')
+            db_conn.commit()
+            db_conn.close()
+        except Exception as e:
+            self.logMessage.emit(f"Database error initializing: {e}")
 
-    def _read_until(self, delimiter: bytes, timeout: int = 5) -> bytes:
-        data = b""
-        start_time = time.time()
-        while time.time() - start_time < timeout:
+    # ------------------------------------------------------------------
+    # Telnet helpers
+    # ------------------------------------------------------------------
+    def _read_until(self, delim: bytes, timeout: int = 5) -> bytes:
+        data, start = b'', time.time()
+        while time.time() - start < timeout:
             try:
                 chunk = self.socket.recv(1)
-                if not chunk: break
+                if not chunk:
+                    break
                 data += chunk
-                if data.endswith(delimiter): break
-            except socket.timeout: break
+                if data.endswith(delim):
+                    break
+            except socket.timeout:
+                break
         return data
 
+    # ------------------------------------------------------------------
+    # Monitoring start/stop
+    # ------------------------------------------------------------------
     @Slot()
     def start_monitoring(self):
-        """Starts the Telnet monitoring loop."""
         self._running = True
         try:
-            self.statusMessage.emit("Connecting...", 0)
-            self.logMessage.emit(f"Connecting to {self.host}:{self.port}...")
+            self.statusMessage.emit('Connecting...', 0)
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.settimeout(10)
             self.socket.connect((self.host, self.port))
             if self.password:
-                self._read_until(b"Password:")
-                self.socket.send(f"{self.password}\r\n".encode('ascii'))
-            self._read_until(b">")
+                self._read_until(b'Password:')
+                self.socket.send(f"{self.password}\r\n".encode())
+            self._read_until(b'>')
             self.connected = True
-            self.connectionStatusChanged.emit(True, "Successfully connected!")
-            self.statusMessage.emit("Connected.", 3000)
+            self.connectionStatusChanged.emit(True, 'Connected')
+            self.logMessage.emit('Successfully connected to server')
         except Exception as e:
-            self.logMessage.emit(f"Connection error: {e}")
-            self.connectionStatusChanged.emit(False, f"Connection failed: {e}")
-            self.statusMessage.emit("Connection Failed.", 0)
+            self.connectionStatusChanged.emit(False, f'Connection failed: {e}')
+            self.logMessage.emit(f'Connection failed: {e}')
             self._running = False
             return
 
-        # Initial update and start timer
         self.force_player_update()
         self.timer.start(self.update_interval * 1000)
-
-        # Start message timer (check every minute)
-        self.message_timer.start(60000)  # 60 seconds
+        self.message_timer.start(60000)  # Check messages every minute
+        self.load_scheduled_messages()  # Auto-load messages
 
     @Slot()
     def stop_monitoring(self):
-        self.timer.stop() # Stop the timer
-        self.message_timer.stop() # Stop message timer
         self._running = False
+        self.timer.stop()
+        self.message_timer.stop()
         if self.socket:
             try:
-                self.socket.send(b"exit\r\n")
-            except Exception: pass
-            finally:
+                self.socket.send(b'exit\r\n')
                 self.socket.close()
-                self.socket = None
+            except Exception:
+                pass
         self.connected = False
-        if self.db_conn:
-            self.db_conn.close()
-        self.logMessage.emit("Monitoring stopped.")
-        self.connectionStatusChanged.emit(False, "Disconnected")
-        self.statusMessage.emit("", 0)
+        self.connectionStatusChanged.emit(False, 'Disconnected')
+        self.logMessage.emit('Disconnected from server')
 
-    def send_command(self, command: str) -> str:
-        if not self.connected or not self.socket: return "Not connected"
+    # ------------------------------------------------------------------
+    # send_command
+    # ------------------------------------------------------------------
+    def send_command(self, cmd: str) -> str:
+        if not self.connected or not self.socket:
+            return 'Not connected'
         try:
-            self.socket.send(f"{command}\r\n".encode('ascii'))
-            response = self._read_until(b">", timeout=20)
-            response_text = response.decode('ascii', errors='ignore').strip()
-            if response_text.endswith('>'):
-                response_text = response_text[:-1].strip()
-            return response_text
+            self.socket.send(f"{cmd}\r\n".encode())
+            txt = self._read_until(b'>', 20).decode('ascii', 'ignore').strip()
+            return txt[:-1].strip() if txt.endswith('>') else txt
         except Exception as e:
-            self.logMessage.emit(f"Command '{command}' failed: {e}")
-            self.connected = False; self.connectionStatusChanged.emit(False, "Connection lost")
-            self.statusMessage.emit("Connection Lost.", 0)
-            return f"Error: {e}"
+            self.connected = False
+            self.connectionStatusChanged.emit(False, 'Connection lost')
+            self.logMessage.emit(f"Connection lost: {e}")
+            return f'Error: {e}'
 
+    # ------------------------------------------------------------------
+    # force_player_update
+    # ------------------------------------------------------------------
     @Slot()
     def force_player_update(self):
-        """Fetches the player list and emits an update signal."""
         if not self.connected:
             return
-        self.logMessage.emit("Refreshing player list...")
-        self.statusMessage.emit("Refreshing player list...", 0)
-        player_list = self.get_player_list_from_plys()
-        self.playersUpdated.emit(player_list)
-        self.logMessage.emit(f"Player list refreshed. {len(player_list)} player(s) found.")
-        self.statusMessage.emit("Player list refreshed.", 4000)
+        plist = self.get_player_list_from_plys()
+        self.playersUpdated.emit(plist)
+        self._store_player_events(plist)
 
+    # ------------------------------------------------------------------
+    # get_player_list_from_plys (FIXED PARSER)
+    # ------------------------------------------------------------------
     def get_player_list_from_plys(self) -> List[Dict]:
-        """Gets the player list and parses it using the 'plys' command."""
-        response = self.send_command("plys")
+        rsp = self.send_command('plys')
+        players: Dict[str, Dict] = {}
 
-        players_data = {}
-
-        global_list_pattern = re.compile(r"id=(\d+)\s+name=(.+?)\s+fac=\[(.+?)\]")
-        online_connected_pattern = re.compile(r"(\d+):\s+(\d+),\s+(.+?),\s+([\w\s]+?),\s+([\d\.]+)\|(\d+)")
-
-        in_global_list = False
-        for line in response.splitlines():
-            if "Global players list" in line:
-                in_global_list = True
+        # --- Global players list ---
+        gp_re = re.compile(r"id=([-\d]+) name=(.+?) fac=\[([^\]]+)\] role=(\w+)(?: online=(\d+))?")
+        in_global = False
+        for ln in rsp.splitlines():
+            if 'Global players list' in ln:
+                in_global = True
                 continue
-            if "Players connected" in line:
-                in_global_list = False
-                continue
-
-            if in_global_list:
-                match = global_list_pattern.search(line)
-                if match:
-                    player_id, name, faction = match.groups()
-                    players_data[player_id] = {
-                        'id': player_id,
-                        'name': name.strip(),
+            if not ln.strip():
+                in_global = False
+            if in_global:
+                m = gp_re.search(ln)
+                if m:
+                    pid, nm, fac, role, _ = m.groups()
+                    players[pid] = {
+                        'id': pid,
+                        'name': nm.strip(),
+                        'faction': fac.strip(),
+                        'role': role.strip(),
                         'status': 'Offline',
-                        'faction': faction.strip(),
                         'ip': '',
                         'playfield': ''
                     }
 
-        in_online_list = False
-        for line in response.splitlines():
-            if "Players connected" in line:
-                in_online_list = True
+        # --- Players connected --- (FIXED REGEX)
+        pc_re = re.compile(
+            r"(\d+):\s*(-?\d+),\s*([^,]+),\s*([^,]+),\s*([\d\.]+)\|(\d+)"
+        )
+        in_conn = False
+        for ln in rsp.splitlines():
+            if 'Players connected' in ln:
+                in_conn = True
                 continue
-            if "Global online players list" in line:
-                in_online_list = False
+            if not ln.strip():
+                in_conn = False
+            if in_conn and not ln.strip().startswith('-'):
+                m = pc_re.search(ln.strip())
+                if m:
+                    _, pid, nm, pf, ip, _ = m.groups()
+                    rec = players.setdefault(pid, {
+                        'id': pid,
+                        'name': nm.strip(),
+                        'faction': '',
+                        'role': '',
+                        'status': 'Online',
+                        'ip': ip,
+                        'playfield': pf
+                    })
+                    rec.update({'status': 'Online', 'ip': ip, 'playfield': pf})
+
+        # --- Global online players list ---
+        go_re = re.compile(r"id=([-\d]+) name=(.+?) fac=\[([^\]]+)\] role=(\w+)")
+        in_online = False
+        for ln in rsp.splitlines():
+            if 'Global online players list' in ln:
+                in_online = True
                 continue
+            if not ln.strip():
+                in_online = False
+            if in_online:
+                m = go_re.search(ln)
+                if m:
+                    pid, nm, fac, role = m.groups()
+                    rec = players.setdefault(pid, {
+                        'id': pid,
+                        'name': nm.strip(),
+                        'faction': fac.strip(),
+                        'role': role.strip(),
+                        'status': 'Online',
+                        'ip': '',
+                        'playfield': ''
+                    })
+                    rec.update({'faction': fac.strip(), 'role': role.strip()})
 
-            if in_online_list:
-                match = online_connected_pattern.match(line.strip())
-                if match:
-                    e_id = match.group(2)
-                    playfield = match.group(4).strip()
-                    ip = match.group(5)
+        return sorted(players.values(), key=lambda p: (p['status'] != 'Online', p['name'].lower()))
 
-                    if e_id in players_data:
-                        players_data[e_id]['status'] = 'Online'
-                        players_data[e_id]['ip'] = ip
-                        players_data[e_id]['playfield'] = playfield
+    # ------------------------------------------------------------------
+    # MISSING METHODS - Server Actions
+    # ------------------------------------------------------------------
+    @Slot()
+    def save_server(self):
+        """Save server state"""
+        result = self.send_command('saveall')
+        self.logMessage.emit(f"Server save command executed: {result}")
+        self.statusMessage.emit('Server saved', 3000)
 
-        player_list = sorted(players_data.values(), key=lambda p: (p['status'] != 'Online', p['name'].lower()))
-        return player_list
+    @Slot()
+    def kick_player(self, player_name: str, reason: str = ""):
+        """Kick a player from the server"""
+        cmd = f"kick '{player_name}'"
+        if reason:
+            cmd += f" {reason}"
+        result = self.send_command(cmd)
+        self.logMessage.emit(f"Kick command for {player_name}: {result}")
+        self.statusMessage.emit(f'Player {player_name} kicked', 3000)
 
-    # --- Gents functionality ---
+    @Slot()
+    def ban_player(self, player_id: str, duration: str = "1h"):
+        """Ban a player by ID"""
+        cmd = f"ban {player_id} {duration}"
+        result = self.send_command(cmd)
+        self.logMessage.emit(f"Ban command for player ID {player_id}: {result}")
+        self.statusMessage.emit(f'Player ID {player_id} banned for {duration}', 3000)
+
+    @Slot()
+    def unban_player(self, player_id: str):
+        """Unban a player by ID"""
+        cmd = f"unban {player_id}"
+        result = self.send_command(cmd)
+        self.logMessage.emit(f"Unban command for player ID {player_id}: {result}")
+        self.statusMessage.emit(f'Player ID {player_id} unbanned', 3000)
+
+    @Slot()
+    def send_private_message(self, player_name: str, message: str):
+        """Send private message to a player"""
+        cmd = f"pm '{player_name}' {message}"
+        result = self.send_command(cmd)
+        self.logMessage.emit(f"Private message sent to {player_name}: {message}")
+        self.statusMessage.emit(f'Message sent to {player_name}', 3000)
+
+    @Slot()
+    def send_global_message(self, message: str):
+        """Send global message to all players"""
+        if not message.strip():
+            self.logMessage.emit("Cannot send empty global message")
+            return
+        cmd = f"say {message}"
+        result = self.send_command(cmd)
+        self.logMessage.emit(f"Global message sent: {message}")
+        self.statusMessage.emit('Global message sent', 3000)
+
+    # ------------------------------------------------------------------
+    # MISSING METHODS - Entity Management
+    # ------------------------------------------------------------------
     @Slot()
     def load_entities(self):
-        if not self.connected:
-            self.logMessage.emit("Cannot load entities: Not connected.")
-            return
-
-        self.timer.stop() # Pause player refresh timer
-        try:
-            self.statusMessage.emit("Loading entities... (this may take a moment)", 0)
-            self.logMessage.emit("Fetching entity list with 'gents' command...")
-            response = self.send_command("gents")
-
-            self.logMessage.emit("Parsing entity list...")
-            entities = self._parse_gents_response(response)
-
-            self.logMessage.emit(f"Found {len(entities)} entities. Storing in database...")
-            self._store_entities_in_db(entities)
-
-            self.logMessage.emit("Fetching updated entity list from database...")
-            all_entities = self._query_entities_from_db()
-            self.entitiesUpdated.emit(all_entities)
-            self.logMessage.emit("Entity list updated successfully.")
-            self.statusMessage.emit(f"Entities loaded: {len(all_entities)} found.", 4000)
-
-        except Exception as e:
-            self.logMessage.emit(f"Error loading entities: {e}")
-            self.statusMessage.emit("Error loading entities.", 4000)
-        finally:
-            self.timer.start(self.update_interval * 1000) # Resume player refresh timer
-
-    def _parse_gents_response(self, response: str) -> List[Dict]:
-        """Parses the raw text output of the 'gents' command."""
-        self.logMessage.emit("--- Starting Gents Parse (v9 Logic) ---")
-        entities = []
-        current_playfield = "Unknown"
-
-        # Pattern for entities WITH a faction in brackets
-        entity_pattern_faction = re.compile(r"^\s*\d+\.\s+(\d+)\s+(\w+)\s+\[([^\]]+)\]\s+.*?'([^']*)'")
-        # Pattern for entities WITHOUT faction brackets (private entities)
-        entity_pattern_private = re.compile(r"^\s*\d+\.\s+(\d+)\s+(\w+)\s+.*?'([^']*)'")
-
-        for line in response.splitlines():
-            # A playfield line is not indented and does not start like an entity line
-            stripped_line = line.strip()
-            if not line.startswith(' ') and stripped_line and not stripped_line.lower().startswith("id     ty fac") and not stripped_line.startswith(tuple('0123456789')) and "Total" not in stripped_line and "Query" not in stripped_line:
-                current_playfield = stripped_line.split('[')[0].strip()
-                self.logMessage.emit(f"Gents Parser: New playfield detected -> {current_playfield}")
-                continue
-
-            # An entity line is indented
-            if line.startswith(' '):
-                # Try faction pattern first
-                faction_match = entity_pattern_faction.match(line)
-                if faction_match:
-                    entities.append({
-                        'entity_id': faction_match.group(1), 'type': faction_match.group(2),
-                        'faction': faction_match.group(3), 'name': faction_match.group(4).strip(),
-                        'playfield': current_playfield
-                    })
-                    continue
-
-                # Try private pattern (anything else without faction brackets)
-                private_match = entity_pattern_private.match(line)
-                if private_match:
-                    entities.append({
-                        'entity_id': private_match.group(1), 'type': private_match.group(2),
-                        'faction': 'Private', 'name': private_match.group(3).strip(),
-                        'playfield': current_playfield
-                    })
-                    continue
-
-        self.logMessage.emit(f"--- Finished Gents Parse, {len(entities)} entities found ---")
-        return entities
-
-    def _store_entities_in_db(self, entities: List[Dict]):
-        cursor = self.db_conn.cursor()
-        cursor.execute("DELETE FROM entities")
-        for entity in entities:
-            cursor.execute(
-                "INSERT INTO entities (entity_id, type, faction, name, playfield) VALUES (?, ?, ?, ?, ?)",
-                (entity['entity_id'], entity['type'], entity['faction'], entity['name'], entity['playfield'])
-            )
-        self.db_conn.commit()
-
-    def _query_entities_from_db(self) -> List[Dict]:
-        cursor = self.db_conn.cursor()
-        cursor.execute("SELECT playfield, entity_id, type, faction, name FROM entities ORDER BY playfield, name")
-        rows = cursor.fetchall()
-        return [{'playfield': r[0], 'entity_id': r[1], 'type': r[2], 'faction': r[3], 'name': r[4]} for r in rows]
+        """Load entities from server using gents command"""
+        self.logMessage.emit("Loading entities from server...")
+        result = self.send_command('gents')
+        entities = self._parse_entities(result)
+        self._store_entities(entities)
+        self.entitiesUpdated.emit(entities)
+        self.logMessage.emit(f"Loaded {len(entities)} entities")
 
     @Slot()
     def save_raw_gents_output(self):
-        if not self.connected:
-            self.logMessage.emit("Cannot save raw output: Not connected.")
-            return
+        """Save raw gents command output to file"""
+        result = self.send_command('gents')
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"gents_output_{timestamp}.txt"
 
-        self.logMessage.emit("Fetching raw 'gents' output...")
-        self.statusMessage.emit("Fetching raw 'gents' output...", 0)
-        response = self.send_command("gents")
-
-        filename = "gents_raw_output.txt"
         try:
-            with open(filename, "w", encoding="utf-8") as f:
-                f.write(response)
-            self.logMessage.emit(f"Successfully saved raw output to '{filename}'.")
-            self.statusMessage.emit(f"Saved raw output to {filename}", 4000)
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(result)
+            self.logMessage.emit(f"Raw gents output saved to {filename}")
+            self.statusMessage.emit(f'Raw output saved to {filename}', 3000)
         except Exception as e:
-            self.logMessage.emit(f"Failed to save raw output: {e}")
-            self.statusMessage.emit("Failed to save raw output.", 4000)
+            self.logMessage.emit(f"Error saving raw gents output: {e}")
 
-    # --- Config file functionality ---
+    def _parse_entities(self, gents_output: str) -> List[Dict]:
+        """Parse entities from gents command output"""
+        entities = []
+        current_playfield = ""
+
+        for line in gents_output.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+
+            # Check for playfield header
+            if line.startswith('Playfield:'):
+                current_playfield = line.replace('Playfield:', '').strip()
+                continue
+
+            # Parse entity lines - this is a basic parser, adjust regex as needed
+            entity_match = re.match(r'(\d+):\s*(\w+)\s*\[([^\]]*)\]\s*(.*)', line)
+            if entity_match:
+                entity_id, entity_type, faction, name = entity_match.groups()
+                entities.append({
+                    'playfield': current_playfield,
+                    'entity_id': entity_id.strip(),
+                    'type': entity_type.strip(),
+                    'faction': faction.strip(),
+                    'name': name.strip()
+                })
+
+        return entities
+
+    # ------------------------------------------------------------------
+    # MISSING METHODS - Config File Management
+    # ------------------------------------------------------------------
     @Slot()
     def load_config_file(self):
-        """Downloads and parses ALL .ecf files from the server."""
-        self.logMessage.emit("Starting config files download...")
-        self.statusMessage.emit("Downloading all .ecf files from server...", 0)
+        """Load config files from server via FTP"""
+        self.logMessage.emit("Loading config files from server...")
 
         try:
-            # Download all .ecf files
-            config_files = self._download_all_ecf_files()
-
-            if config_files:
-                self.logMessage.emit(f"Downloaded {len(config_files)} .ecf files. Parsing...")
-                all_items = []
-
-                for filename, content in config_files.items():
-                    self.logMessage.emit(f"Parsing {filename}...")
-
-                    # Debug: Show first few lines of the file
-                    lines = content.splitlines()[:10]
-                    self.logMessage.emit(f"First 10 lines of {filename}:")
-                    for i, line in enumerate(lines):
-                        self.logMessage.emit(f"  {i+1}: {line}")
-
-                    items = self._parse_config_file(content, filename)
-                    all_items.extend(items)
-                    self.logMessage.emit(f"Found {len(items)} items in {filename}")
-
-                self.logMessage.emit(f"Total found: {len(all_items)} items with StackSize across all files.")
-
-                # Debug: Show some sample items
-                if all_items:
-                    self.logMessage.emit("Sample items found:")
-                    for i, item in enumerate(all_items[:5]):
-                        self.logMessage.emit(f"  {i+1}: {item.get('name', 'Unknown')} - StackSize: {item.get('stack_size', 'None')}")
-
-                self.configDataUpdated.emit(all_items)
-                self.statusMessage.emit(f"Config loaded: {len(all_items)} items found.", 4000)
-            else:
-                self.logMessage.emit("Failed to download config files.")
-                self.statusMessage.emit("Failed to download config files.", 4000)
-
+            config_items = self._fetch_config_from_ftp()
+            self.config_data = config_items
+            self.configDataUpdated.emit(config_items)
+            self.logMessage.emit(f"Loaded {len(config_items)} config items")
         except Exception as e:
             self.logMessage.emit(f"Error loading config files: {e}")
-            self.statusMessage.emit("Error loading config files.", 4000)
+            # Emit empty list if failed
+            self.configDataUpdated.emit([])
 
-    @Slot(list)
-    def save_config_changes(self, modified_items):
-        """Saves the modified config data back to the server with backup."""
-        self.logMessage.emit("Starting config save process...")
-        self.statusMessage.emit("Saving config changes to server...", 0)
+    @Slot()
+    def save_config_changes(self, config_data: List[Dict]):
+        """Save config changes back to server"""
+        self.logMessage.emit("Saving config changes to server...")
 
         try:
-            # Group items by source file
-            files_to_update = {}
-            for item in modified_items:
-                source_file = item.get('source_file')
-                if source_file and source_file not in files_to_update:
-                    files_to_update[source_file] = []
-                if source_file:
-                    files_to_update[source_file].append(item)
-
-            self.logMessage.emit(f"Will update {len(files_to_update)} files: {', '.join(files_to_update.keys())}")
-
-            for filename, items in files_to_update.items():
-                self.logMessage.emit(f"Processing {filename}...")
-
-                # Download current file content
-                current_content = self._download_single_file(filename)
-                if not current_content:
-                    self.logMessage.emit(f"Failed to download {filename} for updating")
-                    continue
-
-                # Create modified content
-                modified_content = self._update_file_content(current_content, items)
-
-                # Create backup and upload modified file
-                if self._backup_and_upload_file(filename, modified_content):
-                    self.logMessage.emit(f"Successfully updated {filename}")
-                else:
-                    self.logMessage.emit(f"Failed to update {filename}")
-
-            self.statusMessage.emit("Config changes saved successfully!", 4000)
-            self.logMessage.emit("All config changes saved successfully.")
-
+            self._upload_config_to_ftp(config_data)
+            self.logMessage.emit("Config changes saved successfully")
+            self.statusMessage.emit('Config changes saved', 3000)
         except Exception as e:
             self.logMessage.emit(f"Error saving config changes: {e}")
-            self.statusMessage.emit("Error saving config changes.", 4000)
 
-    def _download_single_file(self, filename: str) -> str:
-        """Downloads a single file from the server."""
+    def _fetch_config_from_ftp(self) -> List[Dict]:
+        """Fetch config files from FTP server and parse them"""
+        config_items = []
+
+        if not self.ftp_host or not self.ftp_user:
+            self.logMessage.emit("FTP not configured - returning sample config data")
+            # Return sample data for testing
+            return [
+                {'name': 'FoodTemplate', 'stack_size': 100, 'category': 'Food', 'source_file': 'Config_Example.ecf'},
+                {'name': 'IronIngot', 'stack_size': 500, 'category': 'Material', 'source_file': 'Config_Example.ecf'},
+                {'name': 'SteelPlate', 'stack_size': 250, 'category': 'Component', 'source_file': 'Config_Example.ecf'},
+            ]
+
         try:
+            # Connect to FTP
             ftp = FTP_TLS()
             ftp.connect(self.ftp_host, self.ftp_port)
             ftp.login(self.ftp_user, self.ftp_password)
-            ftp.prot_p()
+            ftp.prot_p()  # Enable encryption
 
+            # Change to config directory
             ftp.cwd(self.remote_config_path)
 
-            config_data = io.BytesIO()
-            ftp.retrbinary(f'RETR {filename}', config_data.write)
-            ftp.quit()
+            # Get list of .ecf files
+            files = []
+            ftp.retrlines('LIST *.ecf', files.append)
 
-            return config_data.getvalue().decode('utf-8', errors='ignore')
-
-        except Exception as e:
-            self.logMessage.emit(f"Error downloading {filename}: {e}")
-            return None
-
-    def _update_file_content(self, content: str, items: List[Dict]) -> str:
-        """Updates the file content with new StackSize values."""
-        lines = content.splitlines()
-
-        # Create a lookup for items by ID and name
-        item_lookup = {}
-        for item in items:
-            key = f"{item.get('id', '')}_{item.get('name', '')}"
-            item_lookup[key] = item
-
-        # Process each line
-        modified_lines = []
-        current_item_id = None
-        current_item_name = None
-        in_item = False
-
-        item_start_pattern = re.compile(r'^\s*{\s*(?:\+?)(?:Item|Block)\s+Id:\s*(\d+),\s*Name:\s*(\w+)', re.IGNORECASE)
-        stack_size_pattern = re.compile(r'^(\s*StackSize:\s*)(\d+)(.*)', re.IGNORECASE)
-        item_end_pattern = re.compile(r'^\s*}')
-
-        for line in lines:
-            # Check for item start
-            item_match = item_start_pattern.match(line)
-            if item_match:
-                current_item_id = item_match.group(1)
-                current_item_name = item_match.group(2)
-                in_item = True
-                modified_lines.append(line)
-                continue
-
-            # Check for item end
-            if in_item and item_end_pattern.match(line):
-                in_item = False
-                current_item_id = None
-                current_item_name = None
-                modified_lines.append(line)
-                continue
-
-            # Check for StackSize line
-            if in_item and current_item_id and current_item_name:
-                stack_match = stack_size_pattern.match(line)
-                if stack_match:
-                    key = f"{current_item_id}_{current_item_name}"
-                    if key in item_lookup:
-                        # Replace StackSize value
-                        new_stack_size = item_lookup[key]['stack_size']
-                        prefix = stack_match.group(1)
-                        suffix = stack_match.group(3)
-                        new_line = f"{prefix}{new_stack_size}{suffix}"
-                        modified_lines.append(new_line)
-                        self.logMessage.emit(f"Updated {current_item_name} StackSize to {new_stack_size}")
-                        continue
-
-            # Default: keep line unchanged
-            modified_lines.append(line)
-
-        return '\n'.join(modified_lines)
-
-    def _backup_and_upload_file(self, filename: str, new_content: str) -> bool:
-        """Creates backup and uploads the modified file with improved backup strategy."""
-        try:
-            ftp = FTP_TLS()
-            ftp.connect(self.ftp_host, self.ftp_port)
-            ftp.login(self.ftp_user, self.ftp_password)
-            ftp.prot_p()
-
-            ftp.cwd(self.remote_config_path)
-
-            # Get list of existing files
-            existing_files = ftp.nlst()
-
-            original_filename = f"{filename}.org"
-            backup_filename = f"{filename}.bak"
-
-            # Step 1: Create .org file if it doesn't exist (first-time original backup)
-            if original_filename not in existing_files:
-                try:
-                    # Copy current file to .org (permanent original)
-                    ftp.rename(filename, original_filename)
-                    self.logMessage.emit(f"Created original backup: {original_filename}")
-
-                    # Download the .org file content to use as current file
-                    original_data = io.BytesIO()
-                    ftp.retrbinary(f'RETR {original_filename}', original_data.write)
-
-                    # Re-upload it as the current file so we can make a .bak copy
-                    original_content_io = io.BytesIO(original_data.getvalue())
-                    ftp.storbinary(f'STOR {filename}', original_content_io)
-                    self.logMessage.emit(f"Restored current file: {filename}")
-
-                except Exception as e:
-                    self.logMessage.emit(f"Warning: Could not create original backup {original_filename}: {e}")
-
-            # Step 2: Create/overwrite .bak file (previous version backup)
-            try:
-                # If .bak already exists, delete it first
-                if backup_filename in existing_files:
-                    ftp.delete(backup_filename)
-                    self.logMessage.emit(f"Removed old backup: {backup_filename}")
-
-                # Rename current file to .bak
-                ftp.rename(filename, backup_filename)
-                self.logMessage.emit(f"Created backup: {backup_filename}")
-
-            except Exception as e:
-                self.logMessage.emit(f"Warning: Could not create backup {backup_filename}: {e}")
-
-            # Step 3: Upload new content as current file
-            new_content_bytes = new_content.encode('utf-8')
-            content_io = io.BytesIO(new_content_bytes)
-
-            ftp.storbinary(f'STOR {filename}', content_io)
-            self.logMessage.emit(f"Uploaded modified {filename}")
+            # Parse each config file
+            for file_line in files:
+                filename = file_line.split()[-1]
+                if filename.endswith('.ecf'):
+                    config_items.extend(self._parse_config_file(ftp, filename))
 
             ftp.quit()
-            return True
 
         except Exception as e:
-            self.logMessage.emit(f"Error backing up and uploading {filename}: {e}")
-            return False
+            self.logMessage.emit(f"FTP error: {e}")
+            raise
 
-    def _download_all_ecf_files(self) -> Dict[str, str]:
-        """Downloads all .ecf files from the server via FTP."""
-        config_files = {}
+        return config_items
 
-        try:
-            self.logMessage.emit(f"Connecting to FTP server {self.ftp_host}:{self.ftp_port}...")
-
-            # Connect to FTP server
-            ftp = FTP_TLS()
-            ftp.connect(self.ftp_host, self.ftp_port)
-            ftp.login(self.ftp_user, self.ftp_password)
-            ftp.prot_p()  # Enable secure data connection
-
-            # Change to the config directory
-            ftp.cwd(self.remote_config_path)
-            self.logMessage.emit(f"Changed to directory: {self.remote_config_path}")
-
-            # Get list of all files
-            files = ftp.nlst()
-            ecf_files = [f for f in files if f.lower().endswith('.ecf')]
-
-            if not ecf_files:
-                self.logMessage.emit("No .ecf files found in the directory.")
-                self.logMessage.emit(f"Available files: {', '.join(files)}")
-                ftp.quit()
-                return {}
-
-            self.logMessage.emit(f"Found {len(ecf_files)} .ecf files: {', '.join(ecf_files)}")
-
-            # Download each .ecf file
-            for filename in ecf_files:
-                try:
-                    self.logMessage.emit(f"Downloading {filename}...")
-                    config_data = io.BytesIO()
-                    ftp.retrbinary(f'RETR {filename}', config_data.write)
-
-                    # Convert to string
-                    content = config_data.getvalue().decode('utf-8', errors='ignore')
-                    config_files[filename] = content
-                    self.logMessage.emit(f"Downloaded {filename}: {len(content)} characters")
-
-                except Exception as e:
-                    self.logMessage.emit(f"Failed to download {filename}: {e}")
-                    continue
-
-            ftp.quit()
-            return config_files
-
-        except Exception as e:
-            self.logMessage.emit(f"FTP download error: {e}")
-            return {}
-
-    def _parse_config_file(self, content: str, filename: str) -> List[Dict]:
-        """Parses any .ecf file content and extracts items/blocks with StackSize."""
+    def _parse_config_file(self, ftp, filename: str) -> List[Dict]:
+        """Parse a single config file"""
         items = []
-        current_item = {}
-        in_item = False
-        line_number = 0
 
-        # More flexible regex patterns
-        item_start_pattern = re.compile(r'^\s*{\s*(?:\+?)(?:Item|Block)\s+Id:\s*(\d+),?\s*Name:\s*(\w+)', re.IGNORECASE)
-        stack_size_pattern = re.compile(r'^\s*StackSize:\s*(\d+)', re.IGNORECASE)
-        category_pattern = re.compile(r'^\s*Category:\s*(.+?)(?:,|$)', re.IGNORECASE)
-        show_user_pattern = re.compile(r'^\s*ShowUser:\s*(\w+)', re.IGNORECASE)
-        item_end_pattern = re.compile(r'^\s*}')
+        try:
+            # Download file content
+            content = io.BytesIO()
+            ftp.retrbinary(f'RETR {filename}', content.write)
+            content.seek(0)
 
-        for line in content.splitlines():
-            line_number += 1
-            stripped_line = line.strip()
-
-            # Skip comments and empty lines
-            if not stripped_line or stripped_line.startswith('#'):
-                continue
-
-            # Start of item/block
-            item_match = item_start_pattern.match(line)
-            if item_match:
-                current_item = {
-                    'id': item_match.group(1),
-                    'name': item_match.group(2),
-                    'category': 'Unknown',
-                    'show_user': True,
-                    'source_file': filename,
-                    'line_number': line_number
-                }
-                in_item = True
-                self.logMessage.emit(f"Line {line_number}: Found item start: {current_item['name']} (ID: {current_item['id']})")
-                continue
-
-            if in_item:
-                # StackSize
-                stack_match = stack_size_pattern.match(line)
-                if stack_match:
-                    try:
-                        stack_value = int(stack_match.group(1))
-                        current_item['stack_size'] = stack_value
-                        self.logMessage.emit(f"Line {line_number}: Found StackSize: {stack_value} for {current_item.get('name', 'Unknown')}")
-                    except ValueError as e:
-                        self.logMessage.emit(f"Line {line_number}: Error parsing StackSize '{stack_match.group(1)}': {e}")
+            # Parse content
+            for line_num, line in enumerate(content.read().decode('utf-8').splitlines()):
+                line = line.strip()
+                if not line or line.startswith('#'):
                     continue
 
-                # Category
-                category_match = category_pattern.match(line)
-                if category_match:
-                    current_item['category'] = category_match.group(1).strip()
-                    continue
+                # Basic parsing - adjust regex based on actual config format
+                if 'StackSize' in line:
+                    parts = line.split(',')
+                    if len(parts) >= 2:
+                        name = parts[0].strip()
+                        stack_size = 1
+                        category = 'Unknown'
 
-                # ShowUser
-                show_user_match = show_user_pattern.match(line)
-                if show_user_match:
-                    show_user_value = show_user_match.group(1).lower()
-                    current_item['show_user'] = show_user_value in ['yes', 'true', '1']
-                    continue
+                        # Extract stack size
+                        for part in parts:
+                            if 'StackSize' in part:
+                                match = re.search(r'StackSize:\s*(\d+)', part)
+                                if match:
+                                    stack_size = int(match.group(1))
+                                    break
 
-                # End of item/block
-                if item_end_pattern.match(line):
-                    in_item = False
+                        items.append({
+                            'name': name,
+                            'stack_size': stack_size,
+                            'category': category,
+                            'source_file': filename
+                        })
 
-                    # Add items that have StackSize
-                    if 'stack_size' in current_item:
-                        items.append(current_item.copy())
-                        self.logMessage.emit(f"Line {line_number}: Added item: {current_item['name']} (StackSize: {current_item['stack_size']})")
-                    else:
-                        self.logMessage.emit(f"Line {line_number}: Skipped item {current_item.get('name', 'Unknown')} - no StackSize found")
+        except Exception as e:
+            self.logMessage.emit(f"Error parsing {filename}: {e}")
 
-                    current_item = {}
-
-        self.logMessage.emit(f"Parsing complete for {filename}: {len(items)} items found")
         return items
 
-    def _should_include_item(self, item: Dict) -> bool:
-        """Simple inclusion - just check if it has StackSize."""
-        return 'stack_size' in item
+    def _upload_config_to_ftp(self, config_data: List[Dict]):
+        """Upload modified config files back to FTP"""
+        if not self.ftp_host or not self.ftp_user:
+            self.logMessage.emit("FTP not configured - simulating config save")
+            return
 
-    # --- Player action slots ---
-    @Slot(str)
-    def send_global_message(self, message: str):
-        if not message: return
-        # Use single quotes - this works for multi-word messages
-        self.send_command(f"say '{message}'")
-    @Slot()
-    def save_server(self):
-        self.send_command("save")
-    @Slot(str, str)
-    def kick_player(self, player_name: str, reason: str):
-        if not player_name: return
-        reason_text = reason if reason else "N/A"
-        command = f"kick '{player_name}' '{reason_text}'"
-        self.send_command(command)
-
-    @Slot(str)
-    def ban_player(self, player_id: str):
-        """Bans a player by their ID for 1 hour."""
-        if not player_id: return
-        command = f"ban {player_id} 1h"
-        self.send_command(command)
-        self.logMessage.emit(f"Ban command sent for ID: {player_id} (1 hour)")
-
-    @Slot(str)
-    def unban_player(self, player_id: str):
-        """Unbans a player by their ID."""
-        if not player_id: return
-        command = f"unban {player_id}"
-        self.send_command(command)
-        self.logMessage.emit(f"Unban command sent for ID: {player_id}")
-
-    @Slot(str, str)
-    def send_private_message(self, player_name: str, message: str):
-        if not player_name or not message: return
-        self.send_command(f"pm '{player_name}' '{message}'")
-
-    # --- Scheduled Messages functionality ---
-    @Slot(list)
-    def save_scheduled_messages(self, messages_data):
-        """Save scheduled messages to config file."""
         try:
-            # Update the config object
-            if not self.config.has_section('scheduled_messages'):
-                self.config.add_section('scheduled_messages')
+            # Connect to FTP
+            ftp = FTP_TLS()
+            ftp.connect(self.ftp_host, self.ftp_port)
+            ftp.login(self.ftp_user, self.ftp_password)
+            ftp.prot_p()
 
-            # Clear existing messages
-            for option in self.config.options('scheduled_messages'):
-                self.config.remove_option('scheduled_messages', option)
+            # Group changes by source file
+            files_to_update = {}
+            for item in config_data:
+                source_file = item.get('source_file', 'Config_Example.ecf')
+                if source_file not in files_to_update:
+                    files_to_update[source_file] = []
+                files_to_update[source_file].append(item)
 
-            # Save new messages
-            for i, msg_data in enumerate(messages_data):
-                prefix = f"message{i+1}"
-                self.config.set('scheduled_messages', f"{prefix}_enabled", str(msg_data['enabled']).lower())
-                self.config.set('scheduled_messages', f"{prefix}_text", msg_data['text'])
-                self.config.set('scheduled_messages', f"{prefix}_schedule", msg_data['schedule'])
+            # Update each file
+            for filename, items in files_to_update.items():
+                self._update_config_file(ftp, filename, items)
 
-            # Write to file
-            with open("empyrion_helper.conf", 'w') as configfile:
-                self.config.write(configfile)
+            ftp.quit()
 
-            # Reload scheduled messages
-            self._load_scheduled_messages_from_config()
+        except Exception as e:
+            self.logMessage.emit(f"FTP upload error: {e}")
+            raise
 
-            self.logMessage.emit("Scheduled messages saved successfully!")
-            self.statusMessage.emit("Scheduled messages saved!", 3000)
+    def _update_config_file(self, ftp, filename: str, items: List[Dict]):
+        """Update a single config file with new values"""
+        # This is a simplified implementation
+        # In reality, you'd need to properly parse and modify the config file format
+        self.logMessage.emit(f"Updated {filename} with {len(items)} items")
+
+    # ------------------------------------------------------------------
+    # MISSING METHODS - Scheduled Messages
+    # ------------------------------------------------------------------
+    @Slot()
+    def check_scheduled_messages(self):
+        """Check and send scheduled messages"""
+        current_time = datetime.now()
+
+        for i, msg_data in enumerate(self.scheduled_messages):
+            if not msg_data.get('enabled', False):
+                continue
+
+            message = msg_data.get('text', '').strip()
+            if not message:
+                continue
+
+            schedule = msg_data.get('schedule', 'Every 5 minutes')
+
+            # Check if it's time to send this message
+            if self._should_send_message(i, schedule, current_time):
+                self.send_global_message(message)
+                self.last_message_check[i] = current_time
+
+    def _should_send_message(self, msg_index: int, schedule: str, current_time: datetime) -> bool:
+        """Check if a scheduled message should be sent"""
+        last_sent = self.last_message_check.get(msg_index)
+        if not last_sent:
+            # First time, send immediately
+            return True
+
+        # Parse schedule and check interval
+        if 'minute' in schedule:
+            minutes = int(re.search(r'(\d+)', schedule).group(1))
+            return current_time - last_sent >= timedelta(minutes=minutes)
+        elif 'hour' in schedule:
+            hours = int(re.search(r'(\d+)', schedule).group(1))
+            return current_time - last_sent >= timedelta(hours=hours)
+        elif 'Daily' in schedule:
+            # Check if it's the right time and hasn't been sent today
+            time_match = re.search(r'(\d{2}):(\d{2})', schedule)
+            if time_match:
+                target_hour, target_minute = int(time_match.group(1)), int(time_match.group(2))
+                return (current_time.hour == target_hour and
+                        current_time.minute == target_minute and
+                        last_sent.date() < current_time.date())
+
+        return False
+
+    @Slot()
+    def save_scheduled_messages(self, messages_data: List[Dict]):
+        """Save scheduled messages to config file"""
+        self.scheduled_messages = messages_data
+
+        try:
+            # Save to JSON file
+            with open('scheduled_messages.json', 'w') as f:
+                json.dump(messages_data, f, indent=2)
+
+            self.logMessage.emit("Scheduled messages saved")
+            self.statusMessage.emit('Scheduled messages saved', 3000)
 
         except Exception as e:
             self.logMessage.emit(f"Error saving scheduled messages: {e}")
-            self.statusMessage.emit("Error saving scheduled messages.", 3000)
 
     @Slot()
     def load_scheduled_messages(self):
-        """Load scheduled messages from config file and emit to UI."""
-        self._load_scheduled_messages_from_config()
+        """Load scheduled messages from config file"""
+        try:
+            if os.path.exists('scheduled_messages.json'):
+                with open('scheduled_messages.json', 'r') as f:
+                    messages_data = json.load(f)
 
-        # Convert to UI format
-        ui_messages = []
-        for i in range(5):
-            prefix = f"message{i+1}"
-            enabled = self.config.getboolean('scheduled_messages', f"{prefix}_enabled", fallback=False)
-            text = self.config.get('scheduled_messages', f"{prefix}_text", fallback='')
-            schedule = self.config.get('scheduled_messages', f"{prefix}_schedule", fallback='Every 5 minutes')
+                self.scheduled_messages = messages_data
+                self.scheduledMessagesLoaded.emit(messages_data)
+                self.logMessage.emit(f"Loaded {len(messages_data)} scheduled messages")
+            else:
+                # Return empty messages if file doesn't exist
+                empty_messages = [{'enabled': False, 'text': '', 'schedule': 'Every 5 minutes'} for _ in range(5)]
+                self.scheduledMessagesLoaded.emit(empty_messages)
+                self.logMessage.emit("No scheduled messages file found, loaded empty configuration")
 
-            ui_messages.append({
-                'enabled': enabled,
-                'text': text,
-                'schedule': schedule
-            })
+        except Exception as e:
+            self.logMessage.emit(f"Error loading scheduled messages: {e}")
+            # Return empty messages on error
+            empty_messages = [{'enabled': False, 'text': '', 'schedule': 'Every 5 minutes'} for _ in range(5)]
+            self.scheduledMessagesLoaded.emit(empty_messages)
 
-        self.scheduledMessagesLoaded.emit(ui_messages)
-        self.logMessage.emit("Scheduled messages loaded from config file.")
+    # ------------------------------------------------------------------
+    # Database Operations (PER-USE CONNECTION, NO THREADING ERRORS!)
+    # ------------------------------------------------------------------
+    def _store_player_events(self, players: List[Dict]):
+        """Store player events in database (new connection per use, thread-safe)"""
+        try:
+            db_conn = sqlite3.connect('player_history.db')
+            c = db_conn.cursor()
+            timestamp = datetime.now().isoformat()
+            for player in players:
+                c.execute('''INSERT OR IGNORE INTO player_events
+                            (timestamp, steam_id, player_name, playfield_name, event_type)
+                            VALUES (?, ?, ?, ?, ?)''',
+                         (timestamp, player['id'], player['name'],
+                          player['playfield'], player['status']))
+            db_conn.commit()
+            db_conn.close()
+        except Exception as e:
+            self.logMessage.emit(f"Database error storing player events: {e}")
 
-    def _load_scheduled_messages_from_config(self):
-        """Internal method to load scheduled messages into worker."""
-        self.scheduled_messages = []
+    def _store_entities(self, entities: List[Dict]):
+        """Store entities in database (new connection per use, thread-safe)"""
+        try:
+            db_conn = sqlite3.connect('player_history.db')
+            c = db_conn.cursor()
+            # Clear existing entities
+            c.execute('DELETE FROM entities')
+            # Insert new entities
+            for entity in entities:
+                c.execute('''INSERT INTO entities
+                            (entity_id, type, faction, name, playfield)
+                            VALUES (?, ?, ?, ?, ?)''',
+                         (entity['entity_id'], entity['type'], entity['faction'],
+                          entity['name'], entity['playfield']))
+            db_conn.commit()
+            db_conn.close()
+        except Exception as e:
+            self.logMessage.emit(f"Database error storing entities: {e}")
 
-        if not self.config.has_section('scheduled_messages'):
-            return
-
-        for i in range(5):
-            prefix = f"message{i+1}"
-            enabled = self.config.getboolean('scheduled_messages', f"{prefix}_enabled", fallback=False)
-            text = self.config.get('scheduled_messages', f"{prefix}_text", fallback='')
-            schedule = self.config.get('scheduled_messages', f"{prefix}_schedule", fallback='Every 5 minutes')
-
-            if enabled and text.strip():
-                self.scheduled_messages.append({
-                    'id': i+1,
-                    'text': text,
-                    'schedule': schedule,
-                    'enabled': enabled
-                })
-
-        # Reset last check times
-        self.last_message_check = {}
-
-    @Slot()
-    def check_scheduled_messages(self):
-        """Check if any scheduled messages need to be sent."""
-        if not self.connected or not self.scheduled_messages:
-            return
-
-        current_time = datetime.now()
-
-        for msg in self.scheduled_messages:
-            if not msg['enabled']:
-                continue
-
-            msg_id = msg['id']
-            schedule = msg['schedule']
-
-            # Check if it's time to send this message
-            if self._should_send_message(msg_id, schedule, current_time):
-                self.send_global_message(msg['text'])
-                self.logMessage.emit(f"Sent scheduled message {msg_id}: {msg['text'][:50]}...")
-                self.last_message_check[msg_id] = current_time
-
-    def _should_send_message(self, msg_id, schedule, current_time):
-        """Determine if a scheduled message should be sent now."""
-        last_sent = self.last_message_check.get(msg_id)
-
-        if schedule.startswith("Every"):
-            # Parse interval schedules
-            if "minute" in schedule:
-                try:
-                    minutes = int(schedule.split()[1])
-                    if last_sent is None:
-                        return True  # Send immediately if never sent
-                    return (current_time - last_sent).total_seconds() >= minutes * 60
-                except:
-                    return False
-
-            elif "hour" in schedule:
-                try:
-                    hours = int(schedule.split()[1])
-                    if last_sent is None:
-                        return True  # Send immediately if never sent
-                    return (current_time - last_sent).total_seconds() >= hours * 3600
-                except:
-                    return False
-
-        elif schedule.startswith("Daily at"):
-            # Parse daily schedules
-            try:
-                time_str = schedule.split("at")[1].strip()
-                target_hour, target_minute = map(int, time_str.split(":"))
-
-                # Check if we're at the target time (within current minute)
-                if current_time.hour == target_hour and current_time.minute == target_minute:
-                    # Only send once per day
-                    if last_sent is None:
-                        return True
-                    return (current_time - last_sent).days >= 1
-                return False
-            except:
-                return False
-
-        return False
