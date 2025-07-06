@@ -4,6 +4,7 @@
 # - Robust regex for "Players connected" (Empyrion output)
 # - SAFE SQLite access (no thread errors): DB connection per-use, no shared connection
 # - Fixed indentation and syntax errors in config file methods
+# - FIXED: Messaging commands now properly use single quotes around message text
 # -----------------------------------------------------------------------------
 
 import socket
@@ -312,7 +313,8 @@ class Worker(QObject):
     @Slot()
     def send_private_message(self, player_name: str, message: str):
         """Send private message to a player"""
-        cmd = f"pm '{player_name}' {message}"
+        # FIXED: Add single quotes around the message text
+        cmd = f"pm '{player_name}' '{message}'"
         result = self.send_command(cmd)
         self.logMessage.emit(f"Private message sent to {player_name}: {message}")
         self.statusMessage.emit(f'Message sent to {player_name}', 3000)
@@ -323,7 +325,8 @@ class Worker(QObject):
         if not message.strip():
             self.logMessage.emit("Cannot send empty global message")
             return
-        cmd = f"say {message}"
+        # FIXED: Add single quotes around the message text
+        cmd = f"say '{message}'"
         result = self.send_command(cmd)
         self.logMessage.emit(f"Global message sent: {message}")
         self.statusMessage.emit('Global message sent', 3000)
