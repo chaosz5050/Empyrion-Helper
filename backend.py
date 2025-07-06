@@ -1,8 +1,9 @@
-# backend.py – FIXED VERSION 0.2.2-dev (2025‑07‑05)
+# backend.py – FIXED VERSION 0.2.3-dev (2025‑07‑06)
 # -----------------------------------------------------------------------------
 # Fixes:
 # - Robust regex for "Players connected" (Empyrion output)
 # - SAFE SQLite access (no thread errors): DB connection per-use, no shared connection
+# - Fixed indentation and syntax errors in config file methods
 # -----------------------------------------------------------------------------
 
 import socket
@@ -74,6 +75,9 @@ class Worker(QObject):
 
         # --- config data storage
         self.config_data = []
+        
+        # --- template names for config parsing
+        self.TEMPLATE_NAMES = {"FoodTemplate", "OreTemplate", "ComponentsTemplate"}
 
         # --- Ensure DB is initialized (in main thread is fine, but no connection kept)
         self._init_database()
@@ -270,7 +274,7 @@ class Worker(QObject):
         return sorted(players.values(), key=lambda p: (p['status'] != 'Online', p['name'].lower()))
 
     # ------------------------------------------------------------------
-    # MISSING METHODS - Server Actions
+    # Server Actions
     # ------------------------------------------------------------------
     @Slot()
     def save_server(self):
@@ -325,7 +329,7 @@ class Worker(QObject):
         self.statusMessage.emit('Global message sent', 3000)
 
     # ------------------------------------------------------------------
-    # MISSING METHODS - Entity Management
+    # Entity Management
     # ------------------------------------------------------------------
     @Slot()
     def load_entities(self):
@@ -382,7 +386,7 @@ class Worker(QObject):
         return entities
 
     # ------------------------------------------------------------------
-    # MISSING METHODS - Config File Management
+    # Config File Management
     # ------------------------------------------------------------------
     @Slot()
     def load_config_file(self):
@@ -453,43 +457,49 @@ class Worker(QObject):
         return config_items
 
     def _parse_config_file(self, ftp, filename: str) -> List[Dict]:
-        """Parse a single config file"""
+        """Parse a single config file and return items"""
         items = []
-
         try:
-            # Download file content
             content = io.BytesIO()
             ftp.retrbinary(f'RETR {filename}', content.write)
             content.seek(0)
+            lines = content.read().decode('utf-8').splitlines()
 
-            # Parse content
-            for line_num, line in enumerate(content.read().decode('utf-8').splitlines()):
+            current_item = None
+            inside_block = False
+
+            for line in lines:
                 line = line.strip()
                 if not line or line.startswith('#'):
                     continue
 
-                # Basic parsing - adjust regex based on actual config format
-                if 'StackSize' in line:
-                    parts = line.split(',')
-                    if len(parts) >= 2:
-                        name = parts[0].strip()
-                        stack_size = 1
-                        category = 'Unknown'
+                if line.startswith('{'):
+                    name = line[1:].strip()
+                    current_item = {
+                        'name': name,
+                        'stack_size': None,
+                        'category': 'Unknown',
+                        'source_file': filename,
+                        'is_template': name in self.TEMPLATE_NAMES
+                    }
+                    inside_block = True
+                    continue
 
-                        # Extract stack size
-                        for part in parts:
-                            if 'StackSize' in part:
-                                match = re.search(r'StackSize:\s*(\d+)', part)
-                                if match:
-                                    stack_size = int(match.group(1))
-                                    break
+                if line.startswith('}') and inside_block:
+                    if current_item and current_item['stack_size'] is not None:
+                        items.append(current_item)
+                    current_item = None
+                    inside_block = False
+                    continue
 
-                        items.append({
-                            'name': name,
-                            'stack_size': stack_size,
-                            'category': category,
-                            'source_file': filename
-                        })
+                if inside_block:
+                    if line.startswith('StackSize:'):
+                        try:
+                            current_item['stack_size'] = int(line.split(':')[1].strip())
+                        except ValueError:
+                            pass
+                    elif line.startswith('Category:'):
+                        current_item['category'] = line.split(':')[1].strip()
 
         except Exception as e:
             self.logMessage.emit(f"Error parsing {filename}: {e}")
@@ -528,13 +538,40 @@ class Worker(QObject):
             raise
 
     def _update_config_file(self, ftp, filename: str, items: List[Dict]):
-        """Update a single config file with new values"""
-        # This is a simplified implementation
-        # In reality, you'd need to properly parse and modify the config file format
-        self.logMessage.emit(f"Updated {filename} with {len(items)} items")
+        """Update a single config file with new item data"""
+        self.logMessage.emit(f"Preparing to update {filename} with {len(items)} items")
+
+        try:
+            content = io.BytesIO()
+            content.write("# Auto-generated config update\n".encode('utf-8'))
+
+            for item in items:
+                content.write(f"{{ {item['name']}\n".encode('utf-8'))
+                content.write(f"  StackSize: {item['stack_size']}\n".encode('utf-8'))
+                if item['category']:
+                    content.write(f"  Category: {item['category']}\n".encode('utf-8'))
+                content.write(b"}\n\n")
+
+            content.seek(0)
+
+            # Check if original backup exists
+            filenames = ftp.nlst()
+            if f"{filename}.org" not in filenames:
+                ftp.rename(filename, f"{filename}.org")
+            else:
+                if f"{filename}.bak" in filenames:
+                    ftp.delete(f"{filename}.bak")
+                ftp.rename(filename, f"{filename}.bak")
+
+            # Upload new file
+            ftp.storbinary(f'STOR {filename}', content)
+            self.logMessage.emit(f"{filename} updated and uploaded successfully")
+
+        except Exception as e:
+            self.logMessage.emit(f"Error updating {filename}: {e}")
 
     # ------------------------------------------------------------------
-    # MISSING METHODS - Scheduled Messages
+    # Scheduled Messages
     # ------------------------------------------------------------------
     @Slot()
     def check_scheduled_messages(self):
@@ -658,4 +695,3 @@ class Worker(QObject):
             db_conn.close()
         except Exception as e:
             self.logMessage.emit(f"Database error storing entities: {e}")
-
