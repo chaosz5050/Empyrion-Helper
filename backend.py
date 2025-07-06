@@ -1,10 +1,11 @@
-# backend.py – FIXED VERSION 0.2.3-dev (2025‑07‑06)
+# backend.py – FIXED VERSION 0.2.4-dev (2025‑07‑06)
 # -----------------------------------------------------------------------------
 # Fixes:
 # - Robust regex for "Players connected" (Empyrion output)
 # - SAFE SQLite access (no thread errors): DB connection per-use, no shared connection
 # - Fixed indentation and syntax errors in config file methods
 # - FIXED: Messaging commands now properly use single quotes around message text
+# - FIXED: Scheduled messages error handling and None value protection
 # -----------------------------------------------------------------------------
 
 import socket
@@ -76,7 +77,7 @@ class Worker(QObject):
 
         # --- config data storage
         self.config_data = []
-        
+
         # --- template names for config parsing
         self.TEMPLATE_NAMES = {"FoodTemplate", "OreTemplate", "ComponentsTemplate"}
 
@@ -574,7 +575,7 @@ class Worker(QObject):
             self.logMessage.emit(f"Error updating {filename}: {e}")
 
     # ------------------------------------------------------------------
-    # Scheduled Messages
+    # Scheduled Messages (FIXED)
     # ------------------------------------------------------------------
     @Slot()
     def check_scheduled_messages(self):
@@ -582,10 +583,16 @@ class Worker(QObject):
         current_time = datetime.now()
 
         for i, msg_data in enumerate(self.scheduled_messages):
+            # Ensure msg_data is a dict
+            if not isinstance(msg_data, dict):
+                continue
+
             if not msg_data.get('enabled', False):
                 continue
 
-            message = msg_data.get('text', '').strip()
+            # Fix: Handle None values properly
+            message_text = msg_data.get('text', '') or ''
+            message = message_text.strip()
             if not message:
                 continue
 
@@ -605,19 +612,28 @@ class Worker(QObject):
 
         # Parse schedule and check interval
         if 'minute' in schedule:
-            minutes = int(re.search(r'(\d+)', schedule).group(1))
-            return current_time - last_sent >= timedelta(minutes=minutes)
+            try:
+                minutes = int(re.search(r'(\d+)', schedule).group(1))
+                return current_time - last_sent >= timedelta(minutes=minutes)
+            except (AttributeError, ValueError):
+                return False
         elif 'hour' in schedule:
-            hours = int(re.search(r'(\d+)', schedule).group(1))
-            return current_time - last_sent >= timedelta(hours=hours)
+            try:
+                hours = int(re.search(r'(\d+)', schedule).group(1))
+                return current_time - last_sent >= timedelta(hours=hours)
+            except (AttributeError, ValueError):
+                return False
         elif 'Daily' in schedule:
             # Check if it's the right time and hasn't been sent today
             time_match = re.search(r'(\d{2}):(\d{2})', schedule)
             if time_match:
-                target_hour, target_minute = int(time_match.group(1)), int(time_match.group(2))
-                return (current_time.hour == target_hour and
-                        current_time.minute == target_minute and
-                        last_sent.date() < current_time.date())
+                try:
+                    target_hour, target_minute = int(time_match.group(1)), int(time_match.group(2))
+                    return (current_time.hour == target_hour and
+                            current_time.minute == target_minute and
+                            last_sent.date() < current_time.date())
+                except (AttributeError, ValueError):
+                    return False
 
         return False
 
@@ -645,12 +661,28 @@ class Worker(QObject):
                 with open('scheduled_messages.json', 'r') as f:
                     messages_data = json.load(f)
 
-                self.scheduled_messages = messages_data
-                self.scheduledMessagesLoaded.emit(messages_data)
-                self.logMessage.emit(f"Loaded {len(messages_data)} scheduled messages")
+                # Validate and clean the data
+                if not isinstance(messages_data, list):
+                    messages_data = []
+
+                # Ensure each message has required fields
+                cleaned_messages = []
+                for msg in messages_data:
+                    if isinstance(msg, dict):
+                        cleaned_msg = {
+                            'enabled': bool(msg.get('enabled', False)),
+                            'text': str(msg.get('text', '')),
+                            'schedule': str(msg.get('schedule', 'Every 5 minutes'))
+                        }
+                        cleaned_messages.append(cleaned_msg)
+
+                self.scheduled_messages = cleaned_messages
+                self.scheduledMessagesLoaded.emit(cleaned_messages)
+                self.logMessage.emit(f"Loaded {len(cleaned_messages)} scheduled messages")
             else:
                 # Return empty messages if file doesn't exist
                 empty_messages = [{'enabled': False, 'text': '', 'schedule': 'Every 5 minutes'} for _ in range(5)]
+                self.scheduled_messages = empty_messages
                 self.scheduledMessagesLoaded.emit(empty_messages)
                 self.logMessage.emit("No scheduled messages file found, loaded empty configuration")
 
@@ -658,6 +690,7 @@ class Worker(QObject):
             self.logMessage.emit(f"Error loading scheduled messages: {e}")
             # Return empty messages on error
             empty_messages = [{'enabled': False, 'text': '', 'schedule': 'Every 5 minutes'} for _ in range(5)]
+            self.scheduled_messages = empty_messages
             self.scheduledMessagesLoaded.emit(empty_messages)
 
     # ------------------------------------------------------------------
