@@ -1,4 +1,4 @@
-# main_app.py
+# main_app.py - Enhanced with Player Management Filters
 import sys
 from datetime import datetime
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -12,13 +12,14 @@ from backend import Worker
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Empyrion Server Helper v0.2.0-alpha")
-        self.setGeometry(100, 100, 900, 700)
+        self.setWindowTitle("Empyrion Server Helper v0.2.6-alpha")
+        self.setGeometry(100, 100, 1000, 700)
 
         self.thread = None
         self.worker = None
         self.all_entities_data = []
         self.all_config_data = []
+        self.all_players_data = []  # NEW: Store all player data for filtering
 
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -55,25 +56,38 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(self.autoconnect_checkbox)
         control_layout.addStretch()
 
-        # --- Player Table ---
+        # --- Player Table with Filters (ENHANCED) ---
         player_list_layout = QVBoxLayout()
 
         player_header_layout = QHBoxLayout()
-        player_header_layout.addWidget(QLabel("Players (Online & Offline):"))
+        player_header_layout.addWidget(QLabel("Players (All Known Players):"))
         player_header_layout.addStretch()
         self.refresh_players_button = QPushButton("Refresh")
         self.refresh_players_button.setEnabled(False)
         player_header_layout.addWidget(self.refresh_players_button)
         player_list_layout.addLayout(player_header_layout)
 
+        # NEW: Player filters (like entity tab) - Updated for new Last Seen column
+        player_filter_layout = QHBoxLayout()
+        self.player_column_headers = ["Steam ID", "Name", "Status", "Faction", "IP Address", "Playfield", "Last Seen"]
+        self.player_filter_inputs = []
+        for header in self.player_column_headers:
+            filter_input = QLineEdit()
+            filter_input.setPlaceholderText(f"Filter {header}...")
+            filter_input.textChanged.connect(self.filter_players_table)
+            self.player_filter_inputs.append(filter_input)
+            player_filter_layout.addWidget(filter_input)
+        player_list_layout.addLayout(player_filter_layout)
+
         self.player_table = QTableWidget()
-        self.player_table.setColumnCount(6)
-        self.player_table.setHorizontalHeaderLabels(["ID", "Name", "Status", "Faction", "IP Address", "Playfield"])
+        self.player_table.setColumnCount(7)  # Added Last Seen column
+        self.player_table.setHorizontalHeaderLabels(["Steam ID", "Name", "Status", "Faction", "IP Address", "Playfield", "Last Seen"])
         self.player_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.player_table.setEditTriggers(QTableWidget.EditTriggers.NoEditTriggers)
         self.player_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.player_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.player_table.customContextMenuRequested.connect(self.open_player_menu)
+        self.player_table.setSortingEnabled(True)  # Enable sorting
         player_list_layout.addWidget(self.player_table)
 
         # --- Server Actions ---
@@ -196,7 +210,7 @@ class MainWindow(QMainWindow):
         self.config_changes_made = False
 
     def create_scheduled_messages_tab(self):
-        """Creates the tab for managing scheduled global messages."""
+        """Creates the tab for managing scheduled global messages - SIMPLIFIED SCHEDULING."""
         messages_widget = QWidget()
         layout = QVBoxLayout(messages_widget)
 
@@ -216,7 +230,7 @@ class MainWindow(QMainWindow):
 
         # Separator
         layout.addWidget(QLabel(""))
-        layout.addWidget(QLabel("Scheduled Messages:"))
+        layout.addWidget(QLabel("Scheduled Messages (Interval-based only):"))
 
         # Scheduled messages section
         self.scheduled_messages = []
@@ -233,17 +247,16 @@ class MainWindow(QMainWindow):
             message_input.setPlaceholderText("Enter scheduled message...")
             message_input.textChanged.connect(lambda text, idx=i: self.on_message_text_changed(idx, text))
 
-            # Schedule type combo
+            # Schedule type combo - SIMPLIFIED: Only interval-based scheduling
             schedule_combo = QComboBox()
             schedule_combo.addItems([
                 "Every 5 minutes", "Every 10 minutes", "Every 15 minutes", "Every 30 minutes",
-                "Every 1 hour", "Every 2 hours", "Every 3 hours", "Every 6 hours", "Every 12 hours",
-                "Daily at 08:00", "Daily at 12:00", "Daily at 18:00", "Daily at 20:00", "Custom..."
+                "Every 1 hour", "Every 2 hours", "Every 3 hours", "Every 6 hours", "Every 12 hours"
             ])
             schedule_combo.currentTextChanged.connect(lambda text, idx=i: self.on_schedule_changed(idx, text))
 
             # Delete button
-            delete_button = QPushButton("Delete")
+            delete_button = QPushButton("Clear")
             delete_button.clicked.connect(lambda checked, idx=i: self.on_delete_message(idx))
 
             message_layout.addWidget(enabled_checkbox)
@@ -288,9 +301,9 @@ class MainWindow(QMainWindow):
         self.log_message(f"Message {index+1} schedule changed to: {schedule_text}")
 
     def on_delete_message(self, index):
-        """Called when delete button is clicked."""
-        reply = QMessageBox.question(self, "Delete Message",
-                                   f"Are you sure you want to delete Message {index+1}?",
+        """Called when clear button is clicked."""
+        reply = QMessageBox.question(self, "Clear Message",
+                                   f"Are you sure you want to clear Message {index+1}?",
                                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             # Clear the message
@@ -298,7 +311,7 @@ class MainWindow(QMainWindow):
             msg['enabled_checkbox'].setChecked(False)
             msg['message_input'].clear()
             msg['schedule_combo'].setCurrentIndex(0)
-            self.log_message(f"Message {index+1} deleted")
+            self.log_message(f"Message {index+1} cleared")
 
     def on_save_schedule_clicked(self):
         """Save scheduled messages to config file."""
@@ -333,6 +346,27 @@ class MainWindow(QMainWindow):
                 index = msg['schedule_combo'].findText(schedule_text)
                 if index >= 0:
                     msg['schedule_combo'].setCurrentIndex(index)
+                else:
+                    # If old schedule format found, default to 5 minutes
+                    msg['schedule_combo'].setCurrentIndex(0)
+
+    # NEW: Player table filtering (like entity filtering)
+    def filter_players_table(self):
+        """Hides or shows player rows based on the content of all filter inputs."""
+        filters = [f.text().lower() for f in self.player_filter_inputs]
+
+        for row in range(self.player_table.rowCount()):
+            show_row = True
+            for col_index, filter_text in enumerate(filters):
+                if not filter_text:
+                    continue
+
+                item = self.player_table.item(row, col_index)
+                if not item or filter_text not in item.text().lower():
+                    show_row = False
+                    break
+
+            self.player_table.setRowHidden(row, not show_row)
 
     def start_worker(self):
         self.thread = QThread()
@@ -558,20 +592,104 @@ class MainWindow(QMainWindow):
 
     @Slot(list)
     def update_player_list(self, players):
-        """Updates the player table with data from the 'plys' command."""
-        self.player_table.setSortingEnabled(False)
-        self.player_table.setRowCount(0)
-        self.player_table.setRowCount(len(players))
-        for row, player in enumerate(players):
-            self.player_table.setItem(row, 0, QTableWidgetItem(str(player.get('id', 'N/A'))))
-            self.player_table.setItem(row, 1, QTableWidgetItem(player.get('name', 'N/A')))
-            self.player_table.setItem(row, 2, QTableWidgetItem(player.get('status', 'N/A')))
-            self.player_table.setItem(row, 3, QTableWidgetItem(player.get('faction', 'N/A')))
-            self.player_table.setItem(row, 4, QTableWidgetItem(player.get('ip', '')))
-            self.player_table.setItem(row, 5, QTableWidgetItem(player.get('playfield', '')))
+        """ENHANCED: Updates the player table with all known players + live data."""
+        try:
+            # Store all player data for filtering
+            self.all_players_data = players
+            
+            # DEBUG: Log what we received
+            self.log_message(f"Frontend received {len(players)} players for display")
+            
+            # Clear filters when new data arrives
+            for filter_input in self.player_filter_inputs:
+                filter_input.blockSignals(True)
+                filter_input.clear()
+                filter_input.blockSignals(False)
 
-        self.player_table.setSortingEnabled(True)
-        self.player_table.resizeColumnsToContents()
+            self.log_message("DEBUG: Cleared filters")
+
+            self.player_table.setSortingEnabled(False)
+            self.player_table.setRowCount(0)
+            self.player_table.setRowCount(len(players))
+            
+            self.log_message(f"DEBUG: Set table row count to {len(players)}")
+            
+            # DEBUG: Log first few players
+            for i, player in enumerate(players[:3]):
+                self.log_message(f"Player {i+1}: {player.get('name', 'NO_NAME')} - {player.get('status', 'NO_STATUS')}")
+            
+            self.log_message("DEBUG: Starting to populate table rows...")
+            
+            for row, player in enumerate(players):
+                try:
+                    # Steam ID (partial match search friendly)
+                    steam_id = str(player.get('id', 'N/A'))
+                    self.player_table.setItem(row, 0, QTableWidgetItem(steam_id))
+                    
+                    # Player name
+                    self.player_table.setItem(row, 1, QTableWidgetItem(player.get('name', 'N/A')))
+                    
+                    # Status - NO COLOR CHANGE, just plain text
+                    status = player.get('status', 'N/A')
+                    status_item = QTableWidgetItem(status)
+                    self.player_table.setItem(row, 2, status_item)
+                    
+                    # Faction
+                    self.player_table.setItem(row, 3, QTableWidgetItem(player.get('faction', 'N/A')))
+                    
+                    # IP Address - show for ALL players, not just online
+                    ip = player.get('ip', '')
+                    self.player_table.setItem(row, 4, QTableWidgetItem(ip))
+                    
+                    # Playfield - show for ALL players, not just online
+                    playfield = player.get('playfield', '')
+                    self.player_table.setItem(row, 5, QTableWidgetItem(playfield))
+                    
+                    # Last Seen - format the timestamp nicely
+                    last_seen = ''
+                    if status == 'Online':
+                        last_seen = 'Currently Online'
+                    else:
+                        # Show last seen offline time
+                        last_offline = player.get('last_seen_offline')
+                        if last_offline:
+                            try:
+                                from datetime import datetime
+                                dt = datetime.fromisoformat(last_offline)
+                                last_seen = dt.strftime('%Y-%m-%d %H:%M')
+                            except:
+                                last_seen = 'Unknown'
+                        else:
+                            last_seen = 'Never seen offline'
+                    
+                    self.player_table.setItem(row, 6, QTableWidgetItem(last_seen))
+                    
+                    # DEBUG: Log every 5th player
+                    if row % 5 == 0:
+                        self.log_message(f"DEBUG: Added row {row}: {player.get('name', 'NO_NAME')} - IP: {ip} - Playfield: {playfield}")
+                        
+                except Exception as e:
+                    self.log_message(f"ERROR adding row {row} (player {player.get('name', 'UNKNOWN')}): {e}")
+
+            self.log_message("DEBUG: Finished populating table rows")
+
+            self.player_table.setSortingEnabled(True)
+            self.player_table.resizeColumnsToContents()
+            
+            self.log_message("DEBUG: About to apply filters...")
+            
+            # Apply any existing filters
+            self.filter_players_table()
+            
+            # DEBUG: Log final table state
+            visible_rows = sum(1 for row in range(self.player_table.rowCount()) 
+                              if not self.player_table.isRowHidden(row))
+            self.log_message(f"Player table updated: {self.player_table.rowCount()} total rows, {visible_rows} visible rows")
+            
+        except Exception as e:
+            self.log_message(f"CRITICAL ERROR in update_player_list: {e}")
+            import traceback
+            self.log_message(f"Traceback: {traceback.format_exc()}")
 
     @Slot(list)
     def update_entities_table(self, entities):

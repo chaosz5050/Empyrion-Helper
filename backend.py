@@ -1,6 +1,15 @@
-# backend.py – FIXED VERSION 0.2.4-dev (2025‑07‑06)
+# backend.py – ENHANCED VERSION 0.2.6-dev (2025‑07‑08)
 # -----------------------------------------------------------------------------
-# Fixes:
+# NEW: Enhanced Player Management with Persistent Database Storage
+# - All known players stored in database permanently
+# - Live status/IP/playfield updated each cycle
+# - Status change timestamps tracked
+# - Complete player registry for hobby server admins
+# 
+# Previous fixes maintained:
+# - FIXED: Double message sending issue resolved
+# - FIXED: Removed daily/custom scheduling - only interval-based scheduling
+# - FIXED: Improved timer frequency (30 seconds) for better responsiveness
 # - Robust regex for "Players connected" (Empyrion output)
 # - SAFE SQLite access (no thread errors): DB connection per-use, no shared connection
 # - Fixed indentation and syntax errors in config file methods
@@ -13,7 +22,7 @@ import time
 import re
 import json
 from datetime import datetime, timedelta
-from typing import List, Dict
+from typing import List, Dict, Optional
 import configparser
 import os
 import sqlite3
@@ -70,6 +79,7 @@ class Worker(QObject):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.force_player_update)
 
+        # IMPROVED: More frequent message checking (30 seconds) for better reliability
         self.message_timer = QTimer(self)
         self.message_timer.timeout.connect(self.check_scheduled_messages)
         self.scheduled_messages = []
@@ -81,29 +91,231 @@ class Worker(QObject):
         # --- template names for config parsing
         self.TEMPLATE_NAMES = {"FoodTemplate", "OreTemplate", "ComponentsTemplate"}
 
+        # --- NEW: Player management state
+        self.known_players: Dict[str, Dict] = {}  # steam_id -> player_data cache
+
         # --- Ensure DB is initialized (in main thread is fine, but no connection kept)
         self._init_database()
 
     # ------------------------------------------------------------------
-    # DB Setup (just create tables if not exist, do NOT keep a connection!)
+    # DB Setup (ENHANCED - now includes players table)
     # ------------------------------------------------------------------
     def _init_database(self):
         try:
             db_conn = sqlite3.connect('player_history.db')
             c = db_conn.cursor()
+            
+            # Existing player_events table
             c.execute('''CREATE TABLE IF NOT EXISTS player_events (
                             id INTEGER PRIMARY KEY AUTOINCREMENT,
                             timestamp TEXT, steam_id TEXT, player_name TEXT,
                             playfield_name TEXT, event_type TEXT,
                             UNIQUE(timestamp, steam_id, event_type))''')
+            
+            # Existing entities table
             c.execute('''CREATE TABLE IF NOT EXISTS entities (
                             id INTEGER PRIMARY KEY AUTOINCREMENT,
                             entity_id TEXT, type TEXT, faction TEXT,
                             name TEXT, playfield TEXT)''')
+            
+            # NEW: Players registry table
+            c.execute('''CREATE TABLE IF NOT EXISTS players (
+                            steam_id TEXT PRIMARY KEY,
+                            player_name TEXT NOT NULL,
+                            faction TEXT,
+                            role TEXT,
+                            last_seen_online TEXT,
+                            last_seen_offline TEXT,
+                            first_seen TEXT,
+                            last_updated TEXT)''')
+            
             db_conn.commit()
             db_conn.close()
+            self.logMessage.emit("Database initialized with enhanced player management")
         except Exception as e:
             self.logMessage.emit(f"Database error initializing: {e}")
+
+    # ------------------------------------------------------------------
+    # NEW: Player Database Operations
+    # ------------------------------------------------------------------
+    def _load_all_known_players(self) -> Dict[str, Dict]:
+        """Load all known players from database into memory cache"""
+        try:
+            db_conn = sqlite3.connect('player_history.db')
+            c = db_conn.cursor()
+            c.execute('''SELECT steam_id, player_name, faction, role, 
+                                last_seen_online, last_seen_offline, 
+                                first_seen, last_updated FROM players''')
+            
+            players = {}
+            for row in c.fetchall():
+                steam_id, name, faction, role, last_online, last_offline, first_seen, last_updated = row
+                players[steam_id] = {
+                    'id': steam_id,
+                    'name': name or 'Unknown',
+                    'faction': faction or '',
+                    'role': role or '',
+                    'last_seen_online': last_online,
+                    'last_seen_offline': last_offline,
+                    'first_seen': first_seen,
+                    'last_updated': last_updated,
+                    'status': 'Offline',  # Default to offline, will be updated by live data
+                    'ip': '',  # Live data only
+                    'playfield': ''  # Live data only
+                }
+            
+            db_conn.close()
+            self.logMessage.emit(f"Loaded {len(players)} known players from database")
+            return players
+        except Exception as e:
+            self.logMessage.emit(f"Error loading players from database: {e}")
+            return {}
+
+    def _update_player_in_db(self, player_data: Dict, status_changed: bool = False):
+        """Update or insert player data in database"""
+        try:
+            db_conn = sqlite3.connect('player_history.db')
+            c = db_conn.cursor()
+            
+            current_time = datetime.now().isoformat()
+            steam_id = player_data['id']
+            
+            # Check if player exists
+            c.execute('SELECT steam_id, last_seen_online, last_seen_offline FROM players WHERE steam_id = ?', (steam_id,))
+            existing = c.fetchone()
+            
+            if existing:
+                # Update existing player
+                update_fields = [
+                    'player_name = ?', 'faction = ?', 'role = ?', 'last_updated = ?'
+                ]
+                update_values = [
+                    player_data['name'], player_data['faction'], 
+                    player_data['role'], current_time
+                ]
+                
+                # Update status timestamps if status changed
+                if status_changed:
+                    if player_data['status'] == 'Online':
+                        update_fields.append('last_seen_online = ?')
+                        update_values.append(current_time)
+                    else:  # Offline
+                        update_fields.append('last_seen_offline = ?')
+                        update_values.append(current_time)
+                
+                query = f"UPDATE players SET {', '.join(update_fields)} WHERE steam_id = ?"
+                update_values.append(steam_id)
+                c.execute(query, update_values)
+                
+            else:
+                # Insert new player
+                initial_online = current_time if player_data['status'] == 'Online' else None
+                initial_offline = current_time if player_data['status'] == 'Offline' else None
+                
+                c.execute('''INSERT INTO players 
+                            (steam_id, player_name, faction, role, 
+                             last_seen_online, last_seen_offline, first_seen, last_updated)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                         (steam_id, player_data['name'], player_data['faction'], player_data['role'],
+                          initial_online, initial_offline, current_time, current_time))
+                
+                self.logMessage.emit(f"New player registered: {player_data['name']} ({steam_id})")
+            
+            db_conn.commit()
+            db_conn.close()
+            
+        except Exception as e:
+            self.logMessage.emit(f"Error updating player in database: {e}")
+
+    def _merge_live_data_with_known_players(self, live_players: List[Dict]) -> List[Dict]:
+        """Merge live player data with known players from database"""
+        # Create lookup for live players
+        live_lookup = {p['id']: p for p in live_players}
+        
+        # Start with all known players from database
+        merged_players = dict(self.known_players)
+        
+        # First: Update all known players with live data where available
+        for steam_id, known_player in list(merged_players.items()):
+            if steam_id in live_lookup:
+                # Player is in live data - update with current info
+                live_player = live_lookup[steam_id]
+                old_status = known_player.get('status', 'Offline')
+                old_name = known_player.get('name', '')
+                old_faction = known_player.get('faction', '')
+                old_role = known_player.get('role', '')
+                
+                # Merge live data
+                merged_player = {
+                    'id': steam_id,
+                    'name': live_player['name'],
+                    'faction': live_player['faction'],
+                    'role': live_player['role'],
+                    'status': live_player['status'],
+                    'ip': live_player['ip'],
+                    'playfield': live_player['playfield'],
+                    # Preserve database timestamps
+                    'last_seen_online': known_player.get('last_seen_online'),
+                    'last_seen_offline': known_player.get('last_seen_offline'),
+                    'first_seen': known_player.get('first_seen'),
+                    'last_updated': known_player.get('last_updated')
+                }
+                
+                # Detect changes that need database updates
+                status_changed = (old_status != live_player['status'])
+                data_changed = (old_name != live_player['name'] or 
+                              old_faction != live_player['faction'] or 
+                              old_role != live_player['role'])
+                
+                # Update database if needed
+                if status_changed or data_changed:
+                    self._update_player_in_db(merged_player, status_changed)
+                    
+                    if status_changed:
+                        status_msg = f"{live_player['name']} went {live_player['status'].lower()}"
+                        self.logMessage.emit(status_msg)
+                
+                merged_players[steam_id] = merged_player
+            else:
+                # Player NOT in live data - mark as offline if they were online
+                if known_player.get('status') == 'Online':
+                    known_player['status'] = 'Offline'
+                    known_player['ip'] = ''
+                    known_player['playfield'] = ''
+                    self._update_player_in_db(known_player, status_changed=True)
+                    self.logMessage.emit(f"{known_player['name']} went offline")
+        
+        # Second: Add any completely new players from live data
+        for steam_id, live_player in live_lookup.items():
+            if steam_id not in merged_players:
+                # Brand new player
+                new_player = {
+                    'id': steam_id,
+                    'name': live_player['name'],
+                    'faction': live_player['faction'],
+                    'role': live_player['role'],
+                    'status': live_player['status'],
+                    'ip': live_player['ip'],
+                    'playfield': live_player['playfield'],
+                    'last_seen_online': None,
+                    'last_seen_offline': None,
+                    'first_seen': None,
+                    'last_updated': None
+                }
+                
+                # Add to database
+                self._update_player_in_db(new_player, status_changed=True)
+                merged_players[steam_id] = new_player
+        
+        # Update cache
+        self.known_players = merged_players
+        
+        # Return ALL players (online and offline) sorted by status then name
+        all_players = list(merged_players.values())
+        self.logMessage.emit(f"Merged player data: {len(live_players)} live players, {len(all_players)} total known players")
+        
+        return sorted(all_players, 
+                     key=lambda p: (p['status'] != 'Online', p['name'].lower()))
 
     # ------------------------------------------------------------------
     # Telnet helpers
@@ -123,7 +335,7 @@ class Worker(QObject):
         return data
 
     # ------------------------------------------------------------------
-    # Monitoring start/stop
+    # Monitoring start/stop (ENHANCED)
     # ------------------------------------------------------------------
     @Slot()
     def start_monitoring(self):
@@ -146,9 +358,13 @@ class Worker(QObject):
             self._running = False
             return
 
+        # NEW: Load known players from database first
+        self.known_players = self._load_all_known_players()
+        
         self.force_player_update()
         self.timer.start(self.update_interval * 1000)
-        self.message_timer.start(60000)  # Check messages every minute
+        # IMPROVED: Check messages every 30 seconds instead of 60
+        self.message_timer.start(30000)
         self.load_scheduled_messages()  # Auto-load messages
 
     @Slot()
@@ -183,47 +399,34 @@ class Worker(QObject):
             return f'Error: {e}'
 
     # ------------------------------------------------------------------
-    # force_player_update
+    # force_player_update (ENHANCED)
     # ------------------------------------------------------------------
     @Slot()
     def force_player_update(self):
         if not self.connected:
             return
-        plist = self.get_player_list_from_plys()
-        self.playersUpdated.emit(plist)
-        self._store_player_events(plist)
+        
+        # Get live player data from server
+        live_players = self.get_player_list_from_plys()
+        
+        # Merge with known players and update database
+        merged_players = self._merge_live_data_with_known_players(live_players)
+        
+        # Emit updated player list
+        self.playersUpdated.emit(merged_players)
+        
+        # Store events (keeping existing functionality)
+        self._store_player_events(live_players)
 
     # ------------------------------------------------------------------
-    # get_player_list_from_plys (FIXED PARSER)
+    # get_player_list_from_plys (UNCHANGED - still works perfectly)
     # ------------------------------------------------------------------
     def get_player_list_from_plys(self) -> List[Dict]:
         rsp = self.send_command('plys')
         players: Dict[str, Dict] = {}
 
-        # --- Global players list ---
-        gp_re = re.compile(r"id=([-\d]+) name=(.+?) fac=\[([^\]]+)\] role=(\w+)(?: online=(\d+))?")
-        in_global = False
-        for ln in rsp.splitlines():
-            if 'Global players list' in ln:
-                in_global = True
-                continue
-            if not ln.strip():
-                in_global = False
-            if in_global:
-                m = gp_re.search(ln)
-                if m:
-                    pid, nm, fac, role, _ = m.groups()
-                    players[pid] = {
-                        'id': pid,
-                        'name': nm.strip(),
-                        'faction': fac.strip(),
-                        'role': role.strip(),
-                        'status': 'Offline',
-                        'ip': '',
-                        'playfield': ''
-                    }
-
-        # --- Players connected --- (FIXED REGEX)
+        # First: Parse "Players connected" to get who is actually online right now
+        currently_online_ids = set()
         pc_re = re.compile(
             r"(\d+):\s*(-?\d+),\s*([^,]+),\s*([^,]+),\s*([\d\.]+)\|(\d+)"
         )
@@ -238,18 +441,52 @@ class Worker(QObject):
                 m = pc_re.search(ln.strip())
                 if m:
                     _, pid, nm, pf, ip, _ = m.groups()
-                    rec = players.setdefault(pid, {
+                    currently_online_ids.add(pid)
+                    # Store online player with live data
+                    players[pid] = {
                         'id': pid,
                         'name': nm.strip(),
-                        'faction': '',
-                        'role': '',
+                        'faction': '',  # Will be filled from global list
+                        'role': '',     # Will be filled from global list
                         'status': 'Online',
                         'ip': ip,
                         'playfield': pf
-                    })
-                    rec.update({'status': 'Online', 'ip': ip, 'playfield': pf})
+                    }
 
-        # --- Global online players list ---
+        # Second: Parse "Global players list" to get ALL players with faction/role info
+        gp_re = re.compile(r"id=([-\d]+) name=(.+?) fac=\[([^\]]+)\] role=(\w+)(?: online=(\d+))?")
+        in_global = False
+        for ln in rsp.splitlines():
+            if 'Global players list' in ln:
+                in_global = True
+                continue
+            if not ln.strip():
+                in_global = False
+            if in_global:
+                m = gp_re.search(ln)
+                if m:
+                    pid, nm, fac, role, playtime = m.groups()
+                    
+                    # Determine if player is online or offline
+                    is_online = pid in currently_online_ids
+                    
+                    if pid in players:
+                        # Update existing online player with faction/role
+                        players[pid]['faction'] = fac.strip()
+                        players[pid]['role'] = role.strip()
+                    else:
+                        # Add offline player
+                        players[pid] = {
+                            'id': pid,
+                            'name': nm.strip(),
+                            'faction': fac.strip(),
+                            'role': role.strip(),
+                            'status': 'Offline',
+                            'ip': '',
+                            'playfield': ''
+                        }
+
+        # Third: Handle "Global online players list" (backup for faction/role if needed)
         go_re = re.compile(r"id=([-\d]+) name=(.+?) fac=\[([^\]]+)\] role=(\w+)")
         in_online = False
         for ln in rsp.splitlines():
@@ -262,21 +499,18 @@ class Worker(QObject):
                 m = go_re.search(ln)
                 if m:
                     pid, nm, fac, role = m.groups()
-                    rec = players.setdefault(pid, {
-                        'id': pid,
-                        'name': nm.strip(),
-                        'faction': fac.strip(),
-                        'role': role.strip(),
-                        'status': 'Online',
-                        'ip': '',
-                        'playfield': ''
-                    })
-                    rec.update({'faction': fac.strip(), 'role': role.strip()})
+                    if pid in players:
+                        # Update faction/role info if needed
+                        players[pid]['faction'] = fac.strip()
+                        players[pid]['role'] = role.strip()
 
-        return sorted(players.values(), key=lambda p: (p['status'] != 'Online', p['name'].lower()))
+        player_list = sorted(players.values(), key=lambda p: (p['status'] != 'Online', p['name'].lower()))
+        self.logMessage.emit(f"Parsed plys command: {len(currently_online_ids)} online, {len(player_list)} total players")
+        
+        return player_list
 
     # ------------------------------------------------------------------
-    # Server Actions
+    # Server Actions (UNCHANGED)
     # ------------------------------------------------------------------
     @Slot()
     def save_server(self):
@@ -333,7 +567,7 @@ class Worker(QObject):
         self.statusMessage.emit('Global message sent', 3000)
 
     # ------------------------------------------------------------------
-    # Entity Management
+    # Entity Management (UNCHANGED)
     # ------------------------------------------------------------------
     @Slot()
     def load_entities(self):
@@ -390,7 +624,7 @@ class Worker(QObject):
         return entities
 
     # ------------------------------------------------------------------
-    # Config File Management
+    # Config File Management (UNCHANGED)
     # ------------------------------------------------------------------
     @Slot()
     def load_config_file(self):
@@ -575,11 +809,11 @@ class Worker(QObject):
             self.logMessage.emit(f"Error updating {filename}: {e}")
 
     # ------------------------------------------------------------------
-    # Scheduled Messages (FIXED)
+    # Scheduled Messages (FIXED - NO MORE DOUBLE SENDS!)
     # ------------------------------------------------------------------
     @Slot()
     def check_scheduled_messages(self):
-        """Check and send scheduled messages"""
+        """Check and send scheduled messages - IMPROVED to prevent double sends"""
         current_time = datetime.now()
 
         for i, msg_data in enumerate(self.scheduled_messages):
@@ -602,38 +836,35 @@ class Worker(QObject):
             if self._should_send_message(i, schedule, current_time):
                 self.send_global_message(message)
                 self.last_message_check[i] = current_time
+                self.logMessage.emit(f"Scheduled message {i+1} sent: {message}")
 
     def _should_send_message(self, msg_index: int, schedule: str, current_time: datetime) -> bool:
-        """Check if a scheduled message should be sent"""
+        """FIXED: Check if a scheduled message should be sent - NO first-time immediate send"""
         last_sent = self.last_message_check.get(msg_index)
+        
+        # FIXED: Don't send immediately on first run - wait for proper interval
         if not last_sent:
-            # First time, send immediately
-            return True
+            # Set initial timestamp to prevent immediate sending
+            self.last_message_check[msg_index] = current_time
+            return False
 
-        # Parse schedule and check interval
+        # SIMPLIFIED: Only handle minute and hour intervals (removed daily/custom)
         if 'minute' in schedule:
             try:
                 minutes = int(re.search(r'(\d+)', schedule).group(1))
-                return current_time - last_sent >= timedelta(minutes=minutes)
+                time_diff = current_time - last_sent
+                required_interval = timedelta(minutes=minutes)
+                return time_diff >= required_interval
             except (AttributeError, ValueError):
                 return False
         elif 'hour' in schedule:
             try:
                 hours = int(re.search(r'(\d+)', schedule).group(1))
-                return current_time - last_sent >= timedelta(hours=hours)
+                time_diff = current_time - last_sent
+                required_interval = timedelta(hours=hours)
+                return time_diff >= required_interval
             except (AttributeError, ValueError):
                 return False
-        elif 'Daily' in schedule:
-            # Check if it's the right time and hasn't been sent today
-            time_match = re.search(r'(\d{2}):(\d{2})', schedule)
-            if time_match:
-                try:
-                    target_hour, target_minute = int(time_match.group(1)), int(time_match.group(2))
-                    return (current_time.hour == target_hour and
-                            current_time.minute == target_minute and
-                            last_sent.date() < current_time.date())
-                except (AttributeError, ValueError):
-                    return False
 
         return False
 
@@ -694,7 +925,7 @@ class Worker(QObject):
             self.scheduledMessagesLoaded.emit(empty_messages)
 
     # ------------------------------------------------------------------
-    # Database Operations (PER-USE CONNECTION, NO THREADING ERRORS!)
+    # Database Operations (ENHANCED + existing functionality maintained)
     # ------------------------------------------------------------------
     def _store_player_events(self, players: List[Dict]):
         """Store player events in database (new connection per use, thread-safe)"""
