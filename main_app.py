@@ -760,6 +760,10 @@ class MainWindow(QMainWindow):
                 individuals.append(item)
 
         self.log_message(f"Found {len(templates)} templates and {len(individuals)} individual items")
+        
+        # DEBUG: Log what templates we found
+        for template in templates:
+            self.log_message(f"Template found: {template.get('name', 'UNKNOWN')}")
 
         # Create mapping from table row to data index
         self._table_to_data_map = {}
@@ -772,12 +776,18 @@ class MainWindow(QMainWindow):
 
         # Add templates section if we have any
         if templates:
+            self.log_message(f"Adding templates section with {len(templates)} templates")
+            
             # Add one row for the header
             self.config_table.setRowCount(current_row + 1)
 
-            # Section header - no special colors, just bold text
+            # Section header - bold text with clear visual separation
             header_item = QTableWidgetItem("📋 TEMPLATES (affects multiple items)")
             header_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            # Make header stand out
+            font = header_item.font()
+            font.setBold(True)
+            header_item.setFont(font)
             self.config_table.setItem(current_row, 0, header_item)
 
             for col in range(1, 5):
@@ -814,16 +824,23 @@ class MainWindow(QMainWindow):
                 self.config_table.setItem(current_row, 3, category_item)
                 self.config_table.setItem(current_row, 4, source_item)
 
+                self.log_message(f"Added template row {current_row}: {template.get('name', '')}")
                 current_row += 1
 
         # Add individuals section if we have any
         if individuals:
+            self.log_message(f"Adding individuals section with {len(individuals)} items")
+            
             # Add one row for the header
             self.config_table.setRowCount(current_row + 1)
 
-            # Section header - no special colors, just normal
+            # Section header
             header_item = QTableWidgetItem("⚙️ INDIVIDUAL ITEMS (custom values)")
             header_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            # Make header stand out
+            font = header_item.font()
+            font.setBold(True)
+            header_item.setFont(font)
             self.config_table.setItem(current_row, 0, header_item)
 
             for col in range(1, 5):
@@ -860,6 +877,10 @@ class MainWindow(QMainWindow):
                 self.config_table.setItem(current_row, 3, category_item)
                 self.config_table.setItem(current_row, 4, source_item)
 
+                # DEBUG: Log every 10th individual item
+                if (current_row - (len(templates) + 2)) % 10 == 0:  # Account for headers
+                    self.log_message(f"Added individual row {current_row}: {individual.get('name', '')}")
+                    
                 current_row += 1
 
         self.config_table.setSortingEnabled(True)
@@ -869,6 +890,12 @@ class MainWindow(QMainWindow):
 
         self.log_message(f"Config table updated successfully with {current_row} total rows")
         self.log_message(f"Table to data mapping: {len(self._table_to_data_map)} entries")
+        
+        # DEBUG: Final verification
+        if templates:
+            self.log_message("✅ Templates section should be visible at the top")
+        if individuals:
+            self.log_message("✅ Individual items section should be visible below templates")
 
     def filter_entities_table(self):
         """Hides or shows rows based on the content of all filter inputs."""

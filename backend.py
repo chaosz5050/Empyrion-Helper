@@ -177,7 +177,8 @@ class Worker(QObject):
             db_conn = sqlite3.connect('player_history.db')
             c = db_conn.cursor()
             
-            current_time = datetime.now().isoformat()
+            # Use UTC time for consistent timezone handling
+            current_time = datetime.utcnow().isoformat() + 'Z'
             steam_id = player_data['id']
             
             # Check if player exists
@@ -391,7 +392,14 @@ class Worker(QObject):
         try:
             self.socket.send(f"{cmd}\r\n".encode())
             txt = self._read_until(b'>', 20).decode('ascii', 'ignore').strip()
-            return txt[:-1].strip() if txt.endswith('>') else txt
+            result = txt[:-1].strip() if txt.endswith('>') else txt
+            
+            # DEBUG: Log raw response for plys command
+            if cmd == 'plys':
+                self.logMessage.emit(f"DEBUG: Raw plys response length: {len(result)} chars")
+                self.logMessage.emit(f"DEBUG: Raw response starts with: '{result[:100]}...'")
+            
+            return result
         except Exception as e:
             self.connected = False
             self.connectionStatusChanged.emit(False, 'Connection lost')
@@ -508,6 +516,140 @@ class Worker(QObject):
         self.logMessage.emit(f"Parsed plys command: {len(currently_online_ids)} online, {len(player_list)} total players")
         
         return player_list
+
+    # ------------------------------------------------------------------
+    # NEW: Server Statistics Methods
+    # ------------------------------------------------------------------
+    def _get_server_stats(self):
+        """Try different commands to get server statistics"""
+        # Try common server status commands
+        commands_to_try = ['help', 'console', 'mem', 'perf', 'fps', 'uptime', 'time']
+        
+        for cmd in commands_to_try:
+            try:
+                self.logMessage.emit(f"DEBUG: Trying command '{cmd}' for server stats...")
+                response = self.send_command(cmd)
+                
+                # Check if response contains server stats
+                if any(keyword in response.lower() for keyword in ['uptime', 'fps', 'memory', 'heap', 'performance']):
+                    self.logMessage.emit(f"DEBUG: Found potential server stats in '{cmd}' response!")
+                    self.logMessage.emit(f"DEBUG: Full '{cmd}' response: {response}")
+                    self._parse_server_stats(response)
+                    return
+                elif response and not response.startswith('Error') and 'Unknown command' not in response:
+                    self.logMessage.emit(f"DEBUG: '{cmd}' response: {response[:150]}...")
+                    
+            except Exception as e:
+                self.logMessage.emit(f"DEBUG: Command '{cmd}' failed: {e}")
+        
+        # Try to extract what we can from the 'stats' command we found
+        try:
+            stats_response = self.send_command('stats')
+            if 'Time=' in stats_response and 'Ticks=' in stats_response:
+                self.logMessage.emit("DEBUG: Parsing basic server info from 'stats' command")
+                self._parse_basic_stats(stats_response)
+                return
+        except Exception as e:
+            self.logMessage.emit(f"DEBUG: Failed to parse stats command: {e}")
+        
+        self.logMessage.emit("DEBUG: No server stats found in any command")
+
+    def _parse_basic_stats(self, stats_output: str):
+        """Parse basic server statistics from 'stats' command"""
+        try:
+            stats = {}
+            
+            # Extract game time (convert to uptime-like format)
+            time_match = re.search(r'Time=(\d+)', stats_output)
+            if time_match:
+                time_seconds = int(time_match.group(1))
+                hours = time_seconds // 3600
+                minutes = (time_seconds % 3600) // 60
+                stats['uptime'] = f"{hours}h{minutes}m"
+            
+            # Extract ticks for performance indication
+            ticks_match = re.search(r'Ticks=(\d+)', stats_output)
+            if ticks_match:
+                stats['ticks'] = int(ticks_match.group(1))
+            
+            # Get player count from our plys data (we already have this)
+            # We'll set this in the frontend when we merge data
+            
+            # Set some placeholder values to show the feature works
+            stats['memory'] = 'N/A'
+            stats['fps'] = 'N/A'
+            stats['player_count'] = 1  # We know this from plys
+            
+            if stats:
+                self.logMessage.emit(f"DEBUG: Emitting basic server stats: {stats}")
+                self.serverStatsUpdated.emit(stats)
+                
+        except Exception as e:
+            self.logMessage.emit(f"Error parsing basic stats: {e}")
+    def _parse_server_stats(self, plys_output: str):
+        """Parse server statistics from plys command output"""
+        try:
+            lines = plys_output.splitlines()
+            if not lines:
+                self.logMessage.emit("DEBUG: No lines in plys output for server stats")
+                return
+            
+            # Look for the INFO line in the entire response, not just first line
+            info_line = None
+            for line in lines:
+                if 'Uptime=' in line and 'fps=' in line:
+                    info_line = line
+                    break
+            
+            if not info_line:
+                self.logMessage.emit("DEBUG: No INFO line found with server stats")
+                return
+                
+            self.logMessage.emit(f"DEBUG: Found server stats line: {info_line}")
+            
+            # Parse the INFO line: "INFO: Uptime=07h33m 60.030 2380 heap= 534MB fps=39.9 players= 2 pfs=r0/i1/a1 ticks=27996434 nwqueue=Net:0/2 plys"
+            stats = {}
+            
+            # Extract uptime
+            uptime_match = re.search(r'Uptime=(\d+h\d+m)', info_line)
+            if uptime_match:
+                stats['uptime'] = uptime_match.group(1)
+                self.logMessage.emit(f"DEBUG: Found uptime: {stats['uptime']}")
+            
+            # Extract memory usage
+            heap_match = re.search(r'heap=\s*(\d+MB)', info_line)
+            if heap_match:
+                stats['memory'] = heap_match.group(1)
+                self.logMessage.emit(f"DEBUG: Found memory: {stats['memory']}")
+            
+            # Extract FPS
+            fps_match = re.search(r'fps=([\d\.]+)', info_line)
+            if fps_match:
+                stats['fps'] = float(fps_match.group(1))
+                self.logMessage.emit(f"DEBUG: Found FPS: {stats['fps']}")
+            
+            # Extract player count
+            players_match = re.search(r'players=\s*(\d+)', info_line)
+            if players_match:
+                stats['player_count'] = int(players_match.group(1))
+                self.logMessage.emit(f"DEBUG: Found player count: {stats['player_count']}")
+            
+            # Extract tick count for performance monitoring
+            ticks_match = re.search(r'ticks=(\d+)', info_line)
+            if ticks_match:
+                stats['ticks'] = int(ticks_match.group(1))
+            
+            # Emit server stats if we found any
+            if stats:
+                self.logMessage.emit(f"DEBUG: Emitting server stats: {stats}")
+                self.serverStatsUpdated.emit(stats)
+            else:
+                self.logMessage.emit("DEBUG: No server stats found to emit")
+                
+        except Exception as e:
+            self.logMessage.emit(f"Error parsing server stats: {e}")
+            import traceback
+            self.logMessage.emit(f"Traceback: {traceback.format_exc()}")
 
     # ------------------------------------------------------------------
     # Server Actions (UNCHANGED)
@@ -705,39 +847,74 @@ class Worker(QObject):
 
             current_item = None
             inside_block = False
+            line_number = 0
 
             for line in lines:
+                line_number += 1
                 line = line.strip()
                 if not line or line.startswith('#'):
                     continue
 
                 if line.startswith('{'):
-                    name = line[1:].strip()
-                    current_item = {
-                        'name': name,
-                        'stack_size': None,
-                        'category': 'Unknown',
-                        'source_file': filename,
-                        'is_template': name in self.TEMPLATE_NAMES
-                    }
-                    inside_block = True
+                    # Extract name from { +Item Id: 197, Name: FoodTemplate or { Item Id: 195, Name: PlatinumCard, Ref: ComponentsTemplate
+                    name_match = re.search(r'Name:\s*(\w+)', line)
+                    if name_match:
+                        name = name_match.group(1)
+                        current_item = {
+                            'name': name,
+                            'stack_size': None,
+                            'category': 'Unknown',
+                            'source_file': filename,
+                            'is_template': name in self.TEMPLATE_NAMES,
+                            'line_number': line_number
+                        }
+                        inside_block = True
+                        
+                        # DEBUG: Log what we found
+                        if name in self.TEMPLATE_NAMES:
+                            self.logMessage.emit(f"DEBUG: Found template '{name}' in {filename} at line {line_number}")
+                        
                     continue
 
                 if line.startswith('}') and inside_block:
-                    if current_item and current_item['stack_size'] is not None:
-                        items.append(current_item)
+                    if current_item:
+                        # For templates, add even if no StackSize found (with default)
+                        if current_item['is_template'] and current_item['stack_size'] is None:
+                            current_item['stack_size'] = 0  # Default for templates
+                            
+                        # Only add items that have StackSize or are templates
+                        if current_item['stack_size'] is not None:
+                            items.append(current_item)
+                            
+                            # DEBUG: Log successful addition
+                            if current_item['is_template']:
+                                self.logMessage.emit(f"DEBUG: Added template '{current_item['name']}' with StackSize {current_item['stack_size']}")
+                        else:
+                            # DEBUG: Log why item was skipped
+                            self.logMessage.emit(f"DEBUG: Skipped '{current_item['name']}' - no StackSize found")
+                            
                     current_item = None
                     inside_block = False
                     continue
 
-                if inside_block:
+                if inside_block and current_item:
                     if line.startswith('StackSize:'):
                         try:
-                            current_item['stack_size'] = int(line.split(':')[1].strip())
-                        except ValueError:
-                            pass
+                            stack_value = line.split(':')[1].strip()
+                            current_item['stack_size'] = int(stack_value)
+                            
+                            # DEBUG: Log StackSize found
+                            self.logMessage.emit(f"DEBUG: Found StackSize {stack_value} for '{current_item['name']}'")
+                        except ValueError as e:
+                            self.logMessage.emit(f"DEBUG: Error parsing StackSize for '{current_item['name']}': {e}")
                     elif line.startswith('Category:'):
-                        current_item['category'] = line.split(':')[1].strip()
+                        category_value = line.split(':')[1].strip()
+                        current_item['category'] = category_value
+
+            # DEBUG: Summary for this file
+            template_count = sum(1 for item in items if item['is_template'])
+            individual_count = len(items) - template_count
+            self.logMessage.emit(f"DEBUG: Parsed {filename}: {template_count} templates, {individual_count} individuals")
 
         except Exception as e:
             self.logMessage.emit(f"Error parsing {filename}: {e}")
@@ -932,7 +1109,8 @@ class Worker(QObject):
         try:
             db_conn = sqlite3.connect('player_history.db')
             c = db_conn.cursor()
-            timestamp = datetime.now().isoformat()
+            # Use UTC time for consistent timezone handling
+            timestamp = datetime.utcnow().isoformat() + 'Z'
             for player in players:
                 c.execute('''INSERT OR IGNORE INTO player_events
                             (timestamp, steam_id, player_name, playfield_name, event_type)
