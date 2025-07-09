@@ -645,19 +645,28 @@ class MainWindow(QMainWindow):
                     playfield = player.get('playfield', '')
                     self.player_table.setItem(row, 5, QTableWidgetItem(playfield))
                     
-                    # Last Seen - format the timestamp nicely
+                    # Last Seen - format the timestamp nicely in LOCAL TIME
                     last_seen = ''
                     if status == 'Online':
                         last_seen = 'Currently Online'
                     else:
-                        # Show last seen offline time
+                        # Show last seen offline time converted to local timezone
                         last_offline = player.get('last_seen_offline')
                         if last_offline:
                             try:
-                                from datetime import datetime
-                                dt = datetime.fromisoformat(last_offline)
-                                last_seen = dt.strftime('%Y-%m-%d %H:%M')
-                            except:
+                                from datetime import datetime, timezone
+                                # Parse UTC timestamp
+                                if last_offline.endswith('Z'):
+                                    dt_utc = datetime.fromisoformat(last_offline[:-1]).replace(tzinfo=timezone.utc)
+                                else:
+                                    # Handle old format without 'Z'
+                                    dt_utc = datetime.fromisoformat(last_offline).replace(tzinfo=timezone.utc)
+                                
+                                # Convert to local time
+                                dt_local = dt_utc.astimezone()
+                                last_seen = dt_local.strftime('%Y-%m-%d %H:%M')
+                            except Exception as e:
+                                self.log_message(f"Error parsing timestamp for {player.get('name', 'Unknown')}: {e}")
                                 last_seen = 'Unknown'
                         else:
                             last_seen = 'Never seen offline'
