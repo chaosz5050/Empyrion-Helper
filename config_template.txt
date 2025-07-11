@@ -12,8 +12,8 @@ telnet_port = 30004
 telnet_password = your_rcon_password_here
 
 [monitoring]
-# How often to refresh player list (seconds)
-update_interval = 30
+# How often to refresh player list (seconds) - DEFAULT CHANGED TO 20 SECONDS
+update_interval = 20
 
 # Log file for application events
 log_file = empyrion_helper.log
@@ -39,6 +39,21 @@ password = your_ftp_password
 #   C:\EmpyrionServer\Content\Scenarios\YourScenario\Content\Configuration
 remote_log_path = /path/to/your/scenario/Content/Configuration
 
+# NEW: Custom Player Status Messages
+[messages]
+# Message sent when players join the server
+# Use <playername> where you want the player's name to appear
+welcome_message = Welcome to Space Cowboys, <playername>!
+
+# Message sent when players leave the server
+# Use <playername> where you want the player's name to appear
+goodbye_message = Player <playername> has left our galaxy
+
+# NEW: General App Settings
+[general]
+# Automatically connect to server when app starts
+autoconnect = false
+
 # ============================================================================
 # SETUP INSTRUCTIONS:
 # ============================================================================
@@ -59,15 +74,29 @@ remote_log_path = /path/to/your/scenario/Content/Configuration
 #    - Reforged Eden: .../Scenarios/Reforged Eden/Content/Configuration
 #    - Custom scenarios: .../Scenarios/YourScenarioName/Content/Configuration
 #
-# 4. SECURITY NOTES:
+# 4. CUSTOMIZE PLAYER MESSAGES:
+#    - Edit welcome_message and goodbye_message to fit your server's theme
+#    - Use <playername> as a placeholder for the actual player name
+#    - Examples:
+#      welcome_message = Welcome aboard the Starship Enterprise, <playername>!
+#      goodbye_message = <playername> has departed from the station
+#
+# 5. UPDATE FREQUENCY:
+#    - Default is now 20 seconds (reduced from 30)
+#    - For busy servers (50+ players), consider 30-45 seconds
+#    - For quiet servers (<20 players), you can try 15 seconds
+#    - Monitor your server performance when adjusting
+#
+# 6. SECURITY NOTES:
 #    - Keep this file secure (contains passwords)
 #    - Use strong passwords for RCON and FTP
 #    - Consider using dedicated FTP user with limited permissions
 #    - Add empyrion_helper.conf to your .gitignore if using version control
 #
-# 5. TESTING:
+# 7. TESTING:
 #    - Test RCON connection: telnet <server_ip> <rcon_port>
 #    - Test FTP access: ftp <server_ip>
 #    - Verify configuration path contains ItemsConfig.ecf
+#    - Use the "Test Welcome" and "Test Goodbye" buttons in the app
 #
 # ============================================================================

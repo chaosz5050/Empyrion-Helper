@@ -5,6 +5,48 @@ All notable changes to Empyrion Server Helper will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.7-alpha] - 2025-07-12
+
+### Added
+- **Custom Player Status Messages** - Complete automated welcome/goodbye message system
+  - Customizable welcome message when players join the server
+  - Customizable goodbye message when players leave the server
+  - Template support with `<playername>` placeholder for dynamic player names
+  - Test functionality with "Test Welcome" and "Test Goodbye" buttons
+  - Messages saved to configuration file for persistence across app restarts
+  - Auto-loading of custom messages when app starts
+  - Visual instructions for using the `<playername>` placeholder
+- **Improved Update Frequency** - Reduced default player update interval from 30 to 20 seconds
+  - Better responsiveness for player status changes
+  - Faster detection of players joining/leaving
+  - Still configurable via `update_interval` setting in config file
+
+### Changed
+- **Player Status Detection** - Enhanced real-time player monitoring
+  - Welcome messages sent automatically when players come online
+  - Goodbye messages sent automatically when players go offline
+  - Smart detection prevents duplicate messages for status changes
+- **UI Layout** - Extended Scheduled Messages tab
+  - Added dedicated section for custom player status messages
+  - Clear separation between scheduled messages and player status messages
+  - Improved visual hierarchy with styled headers and instructions
+
+### Technical
+- **Message Template System** - Backend support for dynamic message generation
+  - Secure placeholder replacement for player names
+  - Integration with existing player tracking database
+  - Thread-safe message delivery through Qt signals/slots
+- **Configuration Management** - Extended config file support
+  - New `[messages]` section for custom message templates
+  - Backward compatibility with existing configuration files
+  - Auto-creation of missing config sections
+
+### Fixed
+- **Emoji Character Issues** - Removed all emoji characters from code
+  - Fixed syntax errors caused by Unicode emoji in source files
+  - Replaced emoji icons with plain text labels (e.g., "TEMPLATES", "INDIVIDUAL ITEMS")
+  - Improved cross-platform compatibility
+
 ## [0.2.6-alpha] - 2025-07-09
 - Added a 'Last seen' column
 - Player data is now saved to a local database and compared to live info on start

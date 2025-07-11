@@ -1,12 +1,17 @@
-# backend.py – ENHANCED VERSION 0.2.6-dev (2025‑07‑08)
+# backend.py – ENHANCED VERSION 0.2.7-dev (2025‑07‑11)
 # -----------------------------------------------------------------------------
-# NEW: Enhanced Player Management with Persistent Database Storage
+# NEW: Custom Player Status Messages with Template Support
+# - Welcome/goodbye messages when players join/leave
+# - Customizable message templates with <playername> placeholder
+# - 20-second update interval (reduced from 30 seconds)
+# - Test message functionality
+# 
+# Previous features maintained:
+# - Enhanced Player Management with Persistent Database Storage
 # - All known players stored in database permanently
 # - Live status/IP/playfield updated each cycle
 # - Status change timestamps tracked
 # - Complete player registry for hobby server admins
-# 
-# Previous fixes maintained:
 # - FIXED: Double message sending issue resolved
 # - FIXED: Removed daily/custom scheduling - only interval-based scheduling
 # - FIXED: Improved timer frequency (30 seconds) for better responsiveness
@@ -43,6 +48,7 @@ class Worker(QObject):
     configDataUpdated = Signal(list)
     statusMessage = Signal(str, int)
     scheduledMessagesLoaded = Signal(list)
+    customMessagesLoaded = Signal(str, str)  # NEW: welcome_msg, goodbye_msg
 
     # ------------------------------------------------------------------
     # Init
@@ -73,7 +79,14 @@ class Worker(QObject):
         self.socket = None
         self.connected = False
         self._running = False
-        self.update_interval = self.config.getint('monitoring', 'update_interval', fallback=30)
+        # CHANGED: Reduced update interval from 30 to 20 seconds
+        self.update_interval = self.config.getint('monitoring', 'update_interval', fallback=20)
+
+        # NEW: Custom message templates
+        self.welcome_message_template = self.config.get('messages', 'welcome_message', 
+                                                       fallback='Welcome to Space Cowboys, <playername>!')
+        self.goodbye_message_template = self.config.get('messages', 'goodbye_message', 
+                                                       fallback='Player <playername> has left our galaxy')
 
         # --- timers
         self.timer = QTimer(self)
@@ -273,6 +286,18 @@ class Worker(QObject):
                     self._update_player_in_db(merged_player, status_changed)
                     
                     if status_changed:
+                        # NEW: Send welcome/goodbye messages
+                        if old_status == 'Offline' and live_player['status'] == 'Online':
+                            # Player came online - send welcome message
+                            welcome_msg = self.welcome_message_template.replace('<playername>', live_player['name'])
+                            self.send_global_message(welcome_msg)
+                            self.logMessage.emit(f"Welcome message sent for {live_player['name']}")
+                        elif old_status == 'Online' and live_player['status'] == 'Offline':
+                            # Player went offline - send goodbye message  
+                            goodbye_msg = self.goodbye_message_template.replace('<playername>', live_player['name'])
+                            self.send_global_message(goodbye_msg)
+                            self.logMessage.emit(f"Goodbye message sent for {live_player['name']}")
+                        
                         status_msg = f"{live_player['name']} went {live_player['status'].lower()}"
                         self.logMessage.emit(status_msg)
                 
@@ -283,13 +308,19 @@ class Worker(QObject):
                     known_player['status'] = 'Offline'
                     known_player['ip'] = ''
                     known_player['playfield'] = ''
+                    
+                    # NEW: Send goodbye message for player going offline
+                    goodbye_msg = self.goodbye_message_template.replace('<playername>', known_player['name'])
+                    self.send_global_message(goodbye_msg)
+                    self.logMessage.emit(f"Goodbye message sent for {known_player['name']} (disconnected)")
+                    
                     self._update_player_in_db(known_player, status_changed=True)
                     self.logMessage.emit(f"{known_player['name']} went offline")
         
         # Second: Add any completely new players from live data
         for steam_id, live_player in live_lookup.items():
             if steam_id not in merged_players:
-                # Brand new player
+                # Brand new player - send welcome message
                 new_player = {
                     'id': steam_id,
                     'name': live_player['name'],
@@ -303,6 +334,12 @@ class Worker(QObject):
                     'first_seen': None,
                     'last_updated': None
                 }
+                
+                # NEW: Send welcome message for new player
+                if live_player['status'] == 'Online':
+                    welcome_msg = self.welcome_message_template.replace('<playername>', live_player['name'])
+                    self.send_global_message(welcome_msg)
+                    self.logMessage.emit(f"Welcome message sent for new player {live_player['name']}")
                 
                 # Add to database
                 self._update_player_in_db(new_player, status_changed=True)
@@ -518,140 +555,6 @@ class Worker(QObject):
         return player_list
 
     # ------------------------------------------------------------------
-    # NEW: Server Statistics Methods
-    # ------------------------------------------------------------------
-    def _get_server_stats(self):
-        """Try different commands to get server statistics"""
-        # Try common server status commands
-        commands_to_try = ['help', 'console', 'mem', 'perf', 'fps', 'uptime', 'time']
-        
-        for cmd in commands_to_try:
-            try:
-                self.logMessage.emit(f"DEBUG: Trying command '{cmd}' for server stats...")
-                response = self.send_command(cmd)
-                
-                # Check if response contains server stats
-                if any(keyword in response.lower() for keyword in ['uptime', 'fps', 'memory', 'heap', 'performance']):
-                    self.logMessage.emit(f"DEBUG: Found potential server stats in '{cmd}' response!")
-                    self.logMessage.emit(f"DEBUG: Full '{cmd}' response: {response}")
-                    self._parse_server_stats(response)
-                    return
-                elif response and not response.startswith('Error') and 'Unknown command' not in response:
-                    self.logMessage.emit(f"DEBUG: '{cmd}' response: {response[:150]}...")
-                    
-            except Exception as e:
-                self.logMessage.emit(f"DEBUG: Command '{cmd}' failed: {e}")
-        
-        # Try to extract what we can from the 'stats' command we found
-        try:
-            stats_response = self.send_command('stats')
-            if 'Time=' in stats_response and 'Ticks=' in stats_response:
-                self.logMessage.emit("DEBUG: Parsing basic server info from 'stats' command")
-                self._parse_basic_stats(stats_response)
-                return
-        except Exception as e:
-            self.logMessage.emit(f"DEBUG: Failed to parse stats command: {e}")
-        
-        self.logMessage.emit("DEBUG: No server stats found in any command")
-
-    def _parse_basic_stats(self, stats_output: str):
-        """Parse basic server statistics from 'stats' command"""
-        try:
-            stats = {}
-            
-            # Extract game time (convert to uptime-like format)
-            time_match = re.search(r'Time=(\d+)', stats_output)
-            if time_match:
-                time_seconds = int(time_match.group(1))
-                hours = time_seconds // 3600
-                minutes = (time_seconds % 3600) // 60
-                stats['uptime'] = f"{hours}h{minutes}m"
-            
-            # Extract ticks for performance indication
-            ticks_match = re.search(r'Ticks=(\d+)', stats_output)
-            if ticks_match:
-                stats['ticks'] = int(ticks_match.group(1))
-            
-            # Get player count from our plys data (we already have this)
-            # We'll set this in the frontend when we merge data
-            
-            # Set some placeholder values to show the feature works
-            stats['memory'] = 'N/A'
-            stats['fps'] = 'N/A'
-            stats['player_count'] = 1  # We know this from plys
-            
-            if stats:
-                self.logMessage.emit(f"DEBUG: Emitting basic server stats: {stats}")
-                self.serverStatsUpdated.emit(stats)
-                
-        except Exception as e:
-            self.logMessage.emit(f"Error parsing basic stats: {e}")
-    def _parse_server_stats(self, plys_output: str):
-        """Parse server statistics from plys command output"""
-        try:
-            lines = plys_output.splitlines()
-            if not lines:
-                self.logMessage.emit("DEBUG: No lines in plys output for server stats")
-                return
-            
-            # Look for the INFO line in the entire response, not just first line
-            info_line = None
-            for line in lines:
-                if 'Uptime=' in line and 'fps=' in line:
-                    info_line = line
-                    break
-            
-            if not info_line:
-                self.logMessage.emit("DEBUG: No INFO line found with server stats")
-                return
-                
-            self.logMessage.emit(f"DEBUG: Found server stats line: {info_line}")
-            
-            # Parse the INFO line: "INFO: Uptime=07h33m 60.030 2380 heap= 534MB fps=39.9 players= 2 pfs=r0/i1/a1 ticks=27996434 nwqueue=Net:0/2 plys"
-            stats = {}
-            
-            # Extract uptime
-            uptime_match = re.search(r'Uptime=(\d+h\d+m)', info_line)
-            if uptime_match:
-                stats['uptime'] = uptime_match.group(1)
-                self.logMessage.emit(f"DEBUG: Found uptime: {stats['uptime']}")
-            
-            # Extract memory usage
-            heap_match = re.search(r'heap=\s*(\d+MB)', info_line)
-            if heap_match:
-                stats['memory'] = heap_match.group(1)
-                self.logMessage.emit(f"DEBUG: Found memory: {stats['memory']}")
-            
-            # Extract FPS
-            fps_match = re.search(r'fps=([\d\.]+)', info_line)
-            if fps_match:
-                stats['fps'] = float(fps_match.group(1))
-                self.logMessage.emit(f"DEBUG: Found FPS: {stats['fps']}")
-            
-            # Extract player count
-            players_match = re.search(r'players=\s*(\d+)', info_line)
-            if players_match:
-                stats['player_count'] = int(players_match.group(1))
-                self.logMessage.emit(f"DEBUG: Found player count: {stats['player_count']}")
-            
-            # Extract tick count for performance monitoring
-            ticks_match = re.search(r'ticks=(\d+)', info_line)
-            if ticks_match:
-                stats['ticks'] = int(ticks_match.group(1))
-            
-            # Emit server stats if we found any
-            if stats:
-                self.logMessage.emit(f"DEBUG: Emitting server stats: {stats}")
-                self.serverStatsUpdated.emit(stats)
-            else:
-                self.logMessage.emit("DEBUG: No server stats found to emit")
-                
-        except Exception as e:
-            self.logMessage.emit(f"Error parsing server stats: {e}")
-            import traceback
-            self.logMessage.emit(f"Traceback: {traceback.format_exc()}")
-
-    # ------------------------------------------------------------------
     # Server Actions (UNCHANGED)
     # ------------------------------------------------------------------
     @Slot()
@@ -707,6 +610,49 @@ class Worker(QObject):
         result = self.send_command(cmd)
         self.logMessage.emit(f"Global message sent: {message}")
         self.statusMessage.emit('Global message sent', 3000)
+
+    # ------------------------------------------------------------------
+    # NEW: Custom Message Management
+    # ------------------------------------------------------------------
+    @Slot()
+    def save_custom_messages(self, welcome_msg: str, goodbye_msg: str):
+        """Save custom welcome/goodbye messages to config file"""
+        try:
+            # Update in-memory templates
+            self.welcome_message_template = welcome_msg
+            self.goodbye_message_template = goodbye_msg
+            
+            # Update config file
+            if not self.config.has_section('messages'):
+                self.config.add_section('messages')
+                
+            self.config.set('messages', 'welcome_message', welcome_msg)
+            self.config.set('messages', 'goodbye_message', goodbye_msg)
+            
+            # Write to file
+            with open('empyrion_helper.conf', 'w') as configfile:
+                self.config.write(configfile)
+                
+            self.logMessage.emit("Custom messages saved to config file")
+            self.statusMessage.emit('Custom messages saved', 3000)
+            
+        except Exception as e:
+            self.logMessage.emit(f"Error saving custom messages: {e}")
+
+    @Slot()
+    def load_custom_messages(self):
+        """Load custom messages and emit them to frontend"""
+        welcome_msg = self.config.get('messages', 'welcome_message', 
+                                     fallback='Welcome to Space Cowboys, <playername>!')
+        goodbye_msg = self.config.get('messages', 'goodbye_message', 
+                                     fallback='Player <playername> has left our galaxy')
+        
+        # Update internal templates
+        self.welcome_message_template = welcome_msg
+        self.goodbye_message_template = goodbye_msg
+        
+        # Emit to frontend
+        self.customMessagesLoaded.emit(welcome_msg, goodbye_msg)
 
     # ------------------------------------------------------------------
     # Entity Management (UNCHANGED)

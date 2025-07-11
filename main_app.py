@@ -1,4 +1,4 @@
-# main_app.py - Enhanced with Player Management Filters
+# main_app.py - Enhanced with Custom Player Status Messages v0.2.7-dev
 import sys
 from datetime import datetime
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
@@ -12,14 +12,14 @@ from backend import Worker
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Empyrion Server Helper v0.2.6-alpha")
+        self.setWindowTitle("Empyrion Server Helper v0.2.7-alpha")
         self.setGeometry(100, 100, 1000, 700)
 
         self.thread = None
         self.worker = None
         self.all_entities_data = []
         self.all_config_data = []
-        self.all_players_data = []  # NEW: Store all player data for filtering
+        self.all_players_data = []  # Store all player data for filtering
 
         self.tabs = QTabWidget()
         self.setCentralWidget(self.tabs)
@@ -67,7 +67,7 @@ class MainWindow(QMainWindow):
         player_header_layout.addWidget(self.refresh_players_button)
         player_list_layout.addLayout(player_header_layout)
 
-        # NEW: Player filters (like entity tab) - Updated for new Last Seen column
+        # Player filters - Updated for new Last Seen column
         player_filter_layout = QHBoxLayout()
         self.player_column_headers = ["Steam ID", "Name", "Status", "Faction", "IP Address", "Playfield", "Last Seen"]
         self.player_filter_inputs = []
@@ -210,7 +210,7 @@ class MainWindow(QMainWindow):
         self.config_changes_made = False
 
     def create_scheduled_messages_tab(self):
-        """Creates the tab for managing scheduled global messages - SIMPLIFIED SCHEDULING."""
+        """Creates the tab for managing scheduled global messages and custom player status messages."""
         messages_widget = QWidget()
         layout = QVBoxLayout(messages_widget)
 
@@ -274,15 +274,56 @@ class MainWindow(QMainWindow):
                 'delete_button': delete_button
             })
 
-        # Control buttons
+        # Control buttons for scheduled messages
         control_layout = QHBoxLayout()
         self.save_schedule_button = QPushButton("Save Schedule Configuration")
         self.load_schedule_button = QPushButton("Load Schedule Configuration")
         control_layout.addWidget(self.load_schedule_button)
         control_layout.addWidget(self.save_schedule_button)
         control_layout.addStretch()
-
         layout.addLayout(control_layout)
+
+        # NEW: Custom player status messages section
+        layout.addWidget(QLabel(""))  # Spacer
+        custom_messages_header = QLabel("Custom Player Status Messages:")
+        custom_messages_header.setStyleSheet("font-weight: bold; font-size: 12px;")
+        layout.addWidget(custom_messages_header)
+        
+        # Instructions
+        instructions = QLabel("Use <playername> where you want the player's name to appear in the message.")
+        instructions.setStyleSheet("font-style: italic; color: #666666;")
+        layout.addWidget(instructions)
+
+        # Welcome message
+        welcome_layout = QFormLayout()
+        self.welcome_message_input = QLineEdit()
+        self.welcome_message_input.setPlaceholderText("Welcome to Space Cowboys, <playername>!")
+        self.welcome_message_input.setText("Welcome to Space Cowboys, <playername>!")  # Default
+        welcome_layout.addRow("Welcome Message:", self.welcome_message_input)
+
+        # Goodbye message  
+        self.goodbye_message_input = QLineEdit()
+        self.goodbye_message_input.setPlaceholderText("Player <playername> has left our galaxy")
+        self.goodbye_message_input.setText("Player <playername> has left our galaxy")  # Default
+        welcome_layout.addRow("Goodbye Message:", self.goodbye_message_input)
+
+        layout.addLayout(welcome_layout)
+
+        # Custom message control buttons
+        custom_control_layout = QHBoxLayout()
+        self.save_custom_messages_button = QPushButton("Save Custom Messages")
+        self.load_custom_messages_button = QPushButton("Load Custom Messages")
+        self.test_welcome_button = QPushButton("Test Welcome")
+        self.test_goodbye_button = QPushButton("Test Goodbye")
+        
+        custom_control_layout.addWidget(self.load_custom_messages_button)
+        custom_control_layout.addWidget(self.save_custom_messages_button)
+        custom_control_layout.addWidget(self.test_welcome_button)
+        custom_control_layout.addWidget(self.test_goodbye_button)
+        custom_control_layout.addStretch()
+        
+        layout.addLayout(custom_control_layout)
+
         layout.addStretch()
 
         self.tabs.addTab(messages_widget, "Scheduled Messages")
@@ -350,7 +391,55 @@ class MainWindow(QMainWindow):
                     # If old schedule format found, default to 5 minutes
                     msg['schedule_combo'].setCurrentIndex(0)
 
-    # NEW: Player table filtering (like entity filtering)
+    # NEW: Custom message methods
+    def on_save_custom_messages_clicked(self):
+        """Save custom welcome/goodbye messages."""
+        if self.worker:
+            welcome_msg = self.welcome_message_input.text().strip()
+            goodbye_msg = self.goodbye_message_input.text().strip()
+            
+            if not welcome_msg:
+                welcome_msg = "Welcome to Space Cowboys, <playername>!"
+            if not goodbye_msg:
+                goodbye_msg = "Player <playername> has left our galaxy"
+                
+            self.worker.save_custom_messages(welcome_msg, goodbye_msg)
+
+    def on_load_custom_messages_clicked(self):
+        """Load custom welcome/goodbye messages."""
+        if self.worker:
+            self.worker.load_custom_messages()
+
+    def on_test_welcome_clicked(self):
+        """Test the welcome message with a fake player name."""
+        welcome_msg = self.welcome_message_input.text().strip()
+        if not welcome_msg:
+            welcome_msg = "Welcome to Space Cowboys, <playername>!"
+        
+        test_msg = welcome_msg.replace('<playername>', 'TestPlayer')
+        if self.worker:
+            self.worker.send_global_message(test_msg)
+            self.log_message(f"Test welcome message sent: {test_msg}")
+
+    def on_test_goodbye_clicked(self):
+        """Test the goodbye message with a fake player name."""
+        goodbye_msg = self.goodbye_message_input.text().strip()
+        if not goodbye_msg:
+            goodbye_msg = "Player <playername> has left our galaxy"
+        
+        test_msg = goodbye_msg.replace('<playername>', 'TestPlayer')
+        if self.worker:
+            self.worker.send_global_message(test_msg)
+            self.log_message(f"Test goodbye message sent: {test_msg}")
+
+    @Slot(str, str)
+    def update_custom_messages_ui(self, welcome_msg, goodbye_msg):
+        """Update UI with loaded custom messages."""
+        self.welcome_message_input.setText(welcome_msg)
+        self.goodbye_message_input.setText(goodbye_msg)
+        self.log_message("Custom messages loaded from config")
+
+    # Player table filtering (like entity filtering)
     def filter_players_table(self):
         """Hides or shows player rows based on the content of all filter inputs."""
         filters = [f.text().lower() for f in self.player_filter_inputs]
@@ -380,6 +469,8 @@ class MainWindow(QMainWindow):
         self.worker.configDataUpdated.connect(self.update_config_table)
         self.worker.statusMessage.connect(self.show_temporary_status)
         self.worker.scheduledMessagesLoaded.connect(self.update_scheduled_messages_ui)
+        # NEW: Connect custom messages signal
+        self.worker.customMessagesLoaded.connect(self.update_custom_messages_ui)
 
         self.thread.started.connect(self.worker.start_monitoring)
         self.save_button.clicked.connect(self.worker.save_server)
@@ -391,6 +482,12 @@ class MainWindow(QMainWindow):
         self.send_manual_message_button.clicked.connect(lambda: self.worker.send_global_message(self.manual_message_input.text()))
         self.save_schedule_button.clicked.connect(self.on_save_schedule_clicked)
         self.load_schedule_button.clicked.connect(self.on_load_schedule_clicked)
+        
+        # NEW: Connect custom message buttons
+        self.save_custom_messages_button.clicked.connect(self.on_save_custom_messages_clicked)
+        self.load_custom_messages_button.clicked.connect(self.on_load_custom_messages_clicked)
+        self.test_welcome_button.clicked.connect(self.on_test_welcome_clicked)
+        self.test_goodbye_button.clicked.connect(self.on_test_goodbye_clicked)
 
         self.thread.start()
         self.connect_button.setEnabled(False)
@@ -399,6 +496,9 @@ class MainWindow(QMainWindow):
         self.load_entities_button.setEnabled(True)
         self.save_raw_gents_button.setEnabled(True)
         self.load_config_button.setEnabled(True)
+        
+        # Auto-load custom messages when worker starts
+        self.worker.load_custom_messages()
 
     def stop_worker(self):
         if self.worker:
@@ -782,7 +882,7 @@ class MainWindow(QMainWindow):
             self.config_table.setRowCount(current_row + 1)
 
             # Section header - bold text with clear visual separation
-            header_item = QTableWidgetItem("📋 TEMPLATES (affects multiple items)")
+            header_item = QTableWidgetItem("TEMPLATES (affects multiple items)")
             header_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
             # Make header stand out
             font = header_item.font()
@@ -805,7 +905,7 @@ class MainWindow(QMainWindow):
                 self.config_table.setRowCount(current_row + 1)
                 self._table_to_data_map[current_row] = data_index
 
-                type_item = QTableWidgetItem("📋 Template")
+                type_item = QTableWidgetItem("Template")
                 name_item = QTableWidgetItem(template.get('name', ''))
                 stack_item = QTableWidgetItem(str(template.get('stack_size', '')))
                 category_item = QTableWidgetItem(template.get('category', ''))
@@ -835,7 +935,7 @@ class MainWindow(QMainWindow):
             self.config_table.setRowCount(current_row + 1)
 
             # Section header
-            header_item = QTableWidgetItem("⚙️ INDIVIDUAL ITEMS (custom values)")
+            header_item = QTableWidgetItem("INDIVIDUAL ITEMS (custom values)")
             header_item.setFlags(Qt.ItemFlag.ItemIsEnabled)
             # Make header stand out
             font = header_item.font()
@@ -858,7 +958,7 @@ class MainWindow(QMainWindow):
                 self.config_table.setRowCount(current_row + 1)
                 self._table_to_data_map[current_row] = data_index
 
-                type_item = QTableWidgetItem("⚙️ Item")
+                type_item = QTableWidgetItem("Item")
                 name_item = QTableWidgetItem(individual.get('name', ''))
                 stack_item = QTableWidgetItem(str(individual.get('stack_size', '')))
                 category_item = QTableWidgetItem(individual.get('category', ''))
