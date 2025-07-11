@@ -45,7 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Emoji Character Issues** - Removed all emoji characters from code
   - Fixed syntax errors caused by Unicode emoji in source files
   - Replaced emoji icons with plain text labels (e.g., "TEMPLATES", "INDIVIDUAL ITEMS")
-  - Improved cross-platform compatibility
+  - Improved cross-platform compatibility (the app is written for Linux, but it will probably work on Windows too)
+  - Fixed double player entries  in the player list.
 
 ## [0.2.6-alpha] - 2025-07-09
 - Added a 'Last seen' column
